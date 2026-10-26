@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: trackgrab-backend
+    env: node
+    buildCommand: bash build.sh
+    # Prepend ./bin so yt-dlp (and the ffmpeg it shells out to) are found on PATH.
+    startCommand: PATH="$PWD/bin:$PATH" node server.js
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Enter a fresh value in Render; use the exact same value in WordPress.
+      - key: SCLOUD_API_SECRET
+        sync: false
+      # Point the app at the binaries build.sh installs into ./bin.
+      - key: YTDLP_PATH
+        value: ./bin/yt-dlp
+      - key: FFMPEG_LOCATION
+        value: ./bin
+      - key: FFMPEG_PATH
+        value: ./bin/ffmpeg
+      - key: FFPROBE_PATH
+        value: ./bin/ffprobe
+      # yt-dlp cache on writable tmp (reused across download jobs for speed).
+      - key: YTDLP_CACHE_DIR
+        value: /tmp/yt-dlp-cache
+      # Keep the downloader load safe on a small instance.
+      - key: MAX_CONCURRENT
+        value: "2"
+      - key: MAX_QUEUE
+        value: "30"
+      - key: DOWNLOAD_TIMEOUT_S
+        value: "900"
+      - key: CORS_ALLOWED_ORIGINS
+        value: "https://downloadscloudmp3.com"
+      - key: M4A_BITRATE
+        value: "128"
