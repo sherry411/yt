@@ -699,11 +699,12 @@ router.get("/yt-video-info", (req, res) => {
 });
 
 // ── GET /yt-video-download ────────────────────────────────────────────────────
-// Streams the muxed MP4 straight to the client as it is produced. yt-dlp writes
-// a fragmented MP4 to stdout (video+audio merged by ffmpeg), so the first bytes
-// reach the browser within a second or two — this keeps the connection warm and
-// avoids the proxy/browser idle timeout that killed the old "build then serve"
-// approach (the "code null, no output" failures), and drives a live progress bar.
+// Builds a REAL, seekable MP4 (moov atom at the front, +faststart) in a temp
+// file, then streams that file with a correct Content-Length. Muxing video+audio
+// to stdout can only produce MPEG-TS, which many players (iPhone, Windows Media
+// Player, editors) reject even when the file is named .mp4 — so we build to disk
+// first. This relies on the api host being direct (no 100s Cloudflare cap) with
+// a long Nginx read timeout, so the browser waits through the short build.
 router.get("/yt-video-download", (req, res) => {
   const raw = req.query.url;
   const title = req.query.title || "video";
@@ -730,11 +731,14 @@ router.get("/yt-video-download", (req, res) => {
     let slotReleased = false;
     const releaseSlot = () => { if (slotReleased) return; slotReleased = true; release(); };
 
+    const outTemplate = path.join(workDir, "out.%(ext)s");
+
     const ytdlp = spawn(YTDLP_BIN, [
       "-f", videoFormatSelector(quality),
       "--merge-output-format", "mp4",
-      // Fragmented MP4 so the container can be streamed as it is written.
-      "--postprocessor-args", "ffmpeg:-movflags +frag_keyframe+empty_moov+default_base_moof -threads 0",
+      // Real MP4 with the moov atom at the front so it plays everywhere and can
+      // start playing before it is fully downloaded.
+      "--postprocessor-args", "ffmpeg:-movflags +faststart -threads 0",
       "--concurrent-fragments", String(YTDLP_FRAGMENTS),
       "--retries", "3",
       "--fragment-retries", "5",
@@ -744,44 +748,25 @@ router.get("/yt-video-download", (req, res) => {
       ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
       ...ytdlpCookieArgs(),
       "--no-mtime",
-      "--no-part",
-      "-o", "-",
+      "-o", outTemplate,
       "--no-playlist",
       "--no-progress",
       url,
     ]);
 
     let stderr = "";
-    let started = false;   // first stdout byte seen → headers sent
     let timedOut = false;
     let finished = false;
 
-    const finish = () => { if (finished) return; finished = true; clearTimeout(jobTimer); clearTimeout(idleTimer); cleanup(); releaseSlot(); };
+    const finish = () => { if (finished) return; finished = true; clearTimeout(jobTimer); cleanup(); releaseSlot(); };
 
-    // Overall ceiling and an idle watchdog (no bytes for a while → stuck).
+    // Overall ceiling: kill a build that runs too long.
     const jobTimer = setTimeout(() => { timedOut = true; if (ytdlp.exitCode === null) ytdlp.kill("SIGKILL"); }, YT_TIMEOUT_S * 1000);
-    let idleTimer = setTimeout(idleKill, 120000);
-    function bumpIdle() { clearTimeout(idleTimer); idleTimer = setTimeout(idleKill, 120000); }
-    function idleKill() { timedOut = true; if (ytdlp.exitCode === null) ytdlp.kill("SIGKILL"); }
-
-    const sendHeaders = () => {
-      const safeFile = `${safeTitle}.mp4`;
-      res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
-      res.setHeader("Content-Type", "video/mp4");
-      res.setHeader("Cache-Control", "no-store");
-      res.status(200);
-    };
-
-    ytdlp.stdout.on("data", (chunk) => {
-      bumpIdle();
-      if (!started) { started = true; sendHeaders(); }
-      const ok = res.write(chunk);
-      if (!ok) { ytdlp.stdout.pause(); res.once("drain", () => { try { ytdlp.stdout.resume(); } catch (e) {} }); }
-    });
 
     ytdlp.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 65536) stderr = stderr.slice(-65536); });
 
     ytdlp.on("error", (err) => {
+      clearTimeout(jobTimer);
       console.error("yt video spawn error:", err);
       if (!res.headersSent) {
         if (err && err.code === "ENOENT") {
@@ -796,22 +781,42 @@ router.get("/yt-video-download", (req, res) => {
     });
 
     ytdlp.on("close", (code) => {
-      if (started) {
-        // We already streamed bytes; just close the response cleanly.
-        try { res.end(); } catch (e) {}
+      clearTimeout(jobTimer);
+      // Find the finished MP4 in the work dir.
+      let produced = null;
+      try {
+        const files = fs.readdirSync(workDir).filter((f) => f.startsWith("out.") && !f.endsWith(".part"));
+        const pick = files.find((f) => f.toLowerCase().endsWith(".mp4")) || files[0];
+        if (pick) produced = path.join(workDir, pick);
+      } catch (e) {}
+
+      if (timedOut) {
+        console.error(`yt-dlp (video) timed out for ${url}`);
+        if (!res.headersSent) res.status(504).json({ error: "Download timed out", category: "timeout", message: "The server took too long to build this video.", hint: "Try a lower quality; if it repeats, lower concurrency." });
         finish();
         return;
       }
-      // Nothing was ever sent → we can still return a clean JSON error.
-      if (timedOut) {
-        console.error(`yt-dlp (video) timed out for ${url}`);
-        if (!res.headersSent) res.status(504).json({ error: "Download timed out", category: "timeout", message: "The server took too long to start this download.", hint: "Try a lower quality; if it repeats, lower concurrency." });
-      } else {
+      if (!produced) {
         console.error("yt-dlp (video) failed (code " + code + "), no output. stderr:\n" + stderr);
         const info = classifyDownloadError(stderr);
         if (!res.headersSent) res.status(500).json({ error: "Download failed", category: info.category, message: info.message, hint: info.hint, detail: info.detail });
+        finish();
+        return;
       }
-      finish();
+      if (code !== 0) console.warn("yt-dlp (video) exited " + code + " but output exists; serving anyway.");
+
+      // Serve the real MP4 with a correct Content-Length → accurate progress bar.
+      const safeFile = `${safeTitle}.mp4`;
+      res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Accept-Ranges", "bytes");
+      try { res.setHeader("Content-Length", fs.statSync(produced).size); } catch (e) {}
+
+      const stream = fs.createReadStream(produced);
+      stream.on("error", () => { if (!res.headersSent) res.status(500).json({ error: "Read failed" }); finish(); });
+      stream.on("close", finish);
+      stream.pipe(res);
     });
 
     // Client went away → stop the work immediately.
