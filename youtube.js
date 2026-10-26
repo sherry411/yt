@@ -352,6 +352,35 @@ function verifyVideoOutput(input) {
 //   YTDLP_COOKIES_FROM_BROWSER → browser profile on the VPS, e.g. "chrome"
 //   YTDLP_PROXY                → "http://user:pass@host:port" or "socks5://host:port"
 // A cookies file (if present) wins over a browser profile; proxy is independent.
+// Proxy pool: a single YTDLP_PROXY env, and/or a proxies.txt file next to the
+// app (gitignored) with one proxy per line — Webshare "host:port:user:pass",
+// plain "host:port", or a full "scheme://user:pass@host:port" URL. A random
+// proxy is picked per request so a pool of IPs shares the load.
+let _proxyPool = null;
+function loadProxyPool() {
+  if (_proxyPool) return _proxyPool;
+  const pool = [];
+  const single = (process.env.YTDLP_PROXY || "").trim();
+  if (single) pool.push(single);
+  try {
+    const raw = fs.readFileSync(path.join(__dirname, "proxies.txt"), "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      if (/^[a-z0-9]+:\/\//i.test(t)) { pool.push(t); continue; }       // full URL
+      const p = t.split(":");
+      if (p.length === 4) pool.push(`http://${p[2]}:${p[3]}@${p[0]}:${p[1]}`); // host:port:user:pass
+      else if (p.length === 2) pool.push(`http://${p[0]}:${p[1]}`);            // host:port
+    }
+  } catch (e) {}
+  _proxyPool = pool;
+  return pool;
+}
+function pickProxy() {
+  const pool = loadProxyPool();
+  return pool.length ? pool[Math.floor(Math.random() * pool.length)] : "";
+}
+
 function ytdlpCookieArgs() {
   const args = [];
   let file = process.env.YTDLP_COOKIES || "";
@@ -364,7 +393,7 @@ function ytdlpCookieArgs() {
   }
   if (file && fs.existsSync(file)) args.push("--cookies", file);
   else if (browser) args.push("--cookies-from-browser", browser);
-  const proxy = process.env.YTDLP_PROXY || "";
+  const proxy = pickProxy();
   if (proxy) args.push("--proxy", proxy);
   // Extra extractor-args — PO-token provider + preferred player clients — so
   // bot-check tuning needs no code change. Multiple groups separated by ";;",
