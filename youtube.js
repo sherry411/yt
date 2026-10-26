@@ -366,6 +366,17 @@ function ytdlpCookieArgs() {
   else if (browser) args.push("--cookies-from-browser", browser);
   const proxy = process.env.YTDLP_PROXY || "";
   if (proxy) args.push("--proxy", proxy);
+  // Extra extractor-args — PO-token provider + preferred player clients — so
+  // bot-check tuning needs no code change. Multiple groups separated by ";;",
+  // each passed as its own --extractor-args flag, e.g.:
+  //   youtube:player_client=default,mweb,tv;;youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416
+  const extra = process.env.YTDLP_EXTRACTOR_ARGS || "";
+  if (extra) {
+    for (const part of extra.split(";;")) {
+      const v = part.trim();
+      if (v) args.push("--extractor-args", v);
+    }
+  }
   return args;
 }
 

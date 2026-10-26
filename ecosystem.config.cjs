@@ -10,6 +10,19 @@ if (!SCLOUD_API_SECRET) {
   try { SCLOUD_API_SECRET = fs.readFileSync(path.join(__dirname, "secret.key"), "utf8").trim(); } catch (e) {}
 }
 
+// Optional machine-specific overrides from an UNTRACKED env.local file (one
+// KEY=VALUE per line) — e.g. YTDLP_PROXY, YTDLP_EXTRACTOR_ARGS, YTDLP_COOKIES.
+// Kept out of git so the public repo carries no server-specific config and
+// `git pull` never conflicts with it.
+const localEnv = {};
+try {
+  const raw = fs.readFileSync(path.join(__dirname, "env.local"), "utf8");
+  for (const line of raw.split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (m) localEnv[m[1]] = m[2].replace(/^["']|["']$/g, "");
+  }
+} catch (e) {}
+
 module.exports = {
   apps: [
     {
@@ -34,13 +47,12 @@ module.exports = {
         CORS_ALLOWED_ORIGINS: "https://youtubemp4download.com,https://www.youtubemp4download.com",
         SCLOUD_API_SECRET,
         M4A_BITRATE: "128",
-        // ── Part 9 (optional): set ONLY if YouTube blocks the VPS IP ──
-        // Cookies exported from a logged-in browser (Netscape cookies.txt):
-        // YTDLP_COOKIES: "/home/deploy/trackgrab-backend/cookies.txt",
-        // ...or read live from a browser profile on the VPS: "chrome" | "firefox"
-        // YTDLP_COOKIES_FROM_BROWSER: "chrome",
-        // Residential/HTTP/SOCKS proxy for yt-dlp:
-        // YTDLP_PROXY: "http://user:pass@host:port",
+        // Server-specific knobs (cookies / proxy / PO-token extractor-args) live
+        // in an untracked env.local file; they are merged in here and override
+        // the defaults above. Example env.local lines:
+        //   YTDLP_PROXY=http://user:pass@host:port
+        //   YTDLP_EXTRACTOR_ARGS=youtube:player_client=default,mweb,tv;;youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416
+        ...localEnv,
       },
     },
   ],
