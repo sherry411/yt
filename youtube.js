@@ -354,8 +354,14 @@ function verifyVideoOutput(input) {
 // A cookies file (if present) wins over a browser profile; proxy is independent.
 function ytdlpCookieArgs() {
   const args = [];
-  const file = process.env.YTDLP_COOKIES || "";
+  let file = process.env.YTDLP_COOKIES || "";
   const browser = process.env.YTDLP_COOKIES_FROM_BROWSER || "";
+  // If no explicit path is set, auto-use a cookies.txt dropped next to the app
+  // (gitignored) — just upload the file and restart, no config edit needed.
+  if (!file) {
+    const local = path.join(__dirname, "cookies.txt");
+    if (fs.existsSync(local)) file = local;
+  }
   if (file && fs.existsSync(file)) args.push("--cookies", file);
   else if (browser) args.push("--cookies-from-browser", browser);
   const proxy = process.env.YTDLP_PROXY || "";
