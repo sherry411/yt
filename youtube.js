@@ -409,6 +409,32 @@ function ytdlpCookieArgs() {
   return args;
 }
 
+// Does this yt-dlp stderr look like YouTube's bot-check / rate-limit? Those are
+// per-IP, so retrying with a different proxy from the pool often succeeds.
+function isBotCheckError(stderr) {
+  return /sign in to confirm|not a bot|confirm your age|http error 429|too many requests|rate.?limit/i.test(String(stderr || ""));
+}
+
+// Extra attempts (each re-picks a proxy) when a bot-check is hit; 0 disables it.
+const YT_PROXY_RETRIES = Math.max(0, parseInt(process.env.YT_PROXY_RETRIES || "3", 10) || 0);
+
+// Run a buffered yt-dlp call, rebuilding its args (fresh proxy via ytdlpCookieArgs)
+// and retrying on a bot-check up to YT_PROXY_RETRIES times.
+function execYtdlp(buildArgs, opts, cb) {
+  let attempt = 0;
+  const run = () => {
+    attempt++;
+    execFile(YTDLP_BIN, buildArgs(), opts, (err, stdout, stderr) => {
+      if (err && attempt <= YT_PROXY_RETRIES && isBotCheckError(stderr)) {
+        console.warn(`[yt-retry] bot-check, retry ${attempt}/${YT_PROXY_RETRIES}`);
+        return run();
+      }
+      cb(err, stdout, stderr);
+    });
+  };
+  run();
+}
+
 // ── Priority-aware job queue (independent of server.js's) ─────────────────────
 let activeJobs = 0;
 const jobQueue = [];
@@ -449,15 +475,14 @@ router.get("/yt-info", (req, res) => {
   const url = normalizeYouTubeUrl(raw);
   const playlist = isYouTubePlaylistUrl(url);
 
-  const args = ["-J", "--no-warnings", "--cache-dir", YTDLP_CACHE_DIR, ...ytdlpCookieArgs()];
-  if (playlist) {
-    args.push("--flat-playlist");
-  } else {
-    args.push("--no-playlist");
-  }
-  args.push(url);
+  const buildArgs = () => {
+    const args = ["-J", "--no-warnings", "--cache-dir", YTDLP_CACHE_DIR, ...ytdlpCookieArgs()];
+    args.push(playlist ? "--flat-playlist" : "--no-playlist");
+    args.push(url);
+    return args;
+  };
 
-  execFile(YTDLP_BIN, args, { timeout: 45000, maxBuffer: 48 * 1024 * 1024 }, (err, stdout, stderr) => {
+  execYtdlp(buildArgs, { timeout: 45000, maxBuffer: 48 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
       console.error("yt-dlp yt-info error:", stderr);
       const info = classifyDownloadError(stderr);
@@ -535,93 +560,111 @@ router.get("/yt-download", (req, res) => {
     res.on("finish", releaseSlot);
     res.on("close", releaseSlot);
 
-    const ytdlp = spawn(YTDLP_BIN, [
-      ...buildYtdlpArgs(fmt, opts),
-      "--concurrent-fragments", String(YTDLP_FRAGMENTS),
-      "--retries", "3",
-      "--fragment-retries", "5",
-      "--cache-dir", YTDLP_CACHE_DIR,
-      "--postprocessor-args", "ffmpeg:-threads 0",
-      ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
-      ...ytdlpCookieArgs(),
-      "--no-mtime",
-      "-o", outTemplate,
-      "--no-playlist",
-      "--no-progress",
-      url,
-    ]);
+    let current = null;
+    let aborted = false;
 
-    let stderr = "";
-    let timedOut = false;
-    ytdlp.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 65536) stderr = stderr.slice(-65536); });
-    const jobTimer = setTimeout(() => { timedOut = true; if (ytdlp.exitCode === null) ytdlp.kill("SIGKILL"); }, YT_TIMEOUT_S * 1000);
+    const runAttempt = (attempt) => {
+      if (aborted) { cleanup(); releaseSlot(); return; }
+      cleanup(); // clear any partial output left by a previous attempt
 
-    ytdlp.on("error", (err) => {
-      clearTimeout(jobTimer);
-      console.error("yt spawn error:", err);
-      cleanup();
-      if (!res.headersSent) {
-        if (err && err.code === "ENOENT") {
-          res.status(500).json({ error: "Download failed", category: "ytdlp-missing", message: "yt-dlp isn't installed or isn't on the server's PATH.", hint: "Install yt-dlp (or set YTDLP_PATH) and restart." });
-        } else {
-          res.status(500).json({ error: "Download failed", category: "spawn", message: "The server couldn't start the download process.", hint: "Check the server logs." });
+      const ytdlp = spawn(YTDLP_BIN, [
+        ...buildYtdlpArgs(fmt, opts),
+        "--concurrent-fragments", String(YTDLP_FRAGMENTS),
+        "--retries", "3",
+        "--fragment-retries", "5",
+        "--cache-dir", YTDLP_CACHE_DIR,
+        "--postprocessor-args", "ffmpeg:-threads 0",
+        ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
+        ...ytdlpCookieArgs(),
+        "--no-mtime",
+        "-o", outTemplate,
+        "--no-playlist",
+        "--no-progress",
+        url,
+      ]);
+      current = ytdlp;
+
+      let stderr = "";
+      let timedOut = false;
+      ytdlp.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 65536) stderr = stderr.slice(-65536); });
+      const jobTimer = setTimeout(() => { timedOut = true; if (ytdlp.exitCode === null) ytdlp.kill("SIGKILL"); }, YT_TIMEOUT_S * 1000);
+
+      ytdlp.on("error", (err) => {
+        clearTimeout(jobTimer);
+        console.error("yt spawn error:", err);
+        cleanup();
+        if (!res.headersSent) {
+          if (err && err.code === "ENOENT") {
+            res.status(500).json({ error: "Download failed", category: "ytdlp-missing", message: "yt-dlp isn't installed or isn't on the server's PATH.", hint: "Install yt-dlp (or set YTDLP_PATH) and restart." });
+          } else {
+            res.status(500).json({ error: "Download failed", category: "spawn", message: "The server couldn't start the download process.", hint: "Check the server logs." });
+          }
         }
-      }
-      releaseSlot();
-    });
-
-    ytdlp.on("close", async (code) => {
-      clearTimeout(jobTimer);
-      let produced = null;
-      try {
-        const dir = os.tmpdir();
-        const base = prefix + ".";
-        const extOf = (f) => f.slice(base.length).toLowerCase();
-        const files = fs.readdirSync(dir).filter((f) => f.startsWith(base) && !f.endsWith(".part"));
-        const pick = files.find((f) => extOf(f) === fmt.ext) || files.find((f) => extOf(f) === fmt.audioFormat);
-        if (pick) produced = path.join(dir, pick);
-      } catch (e) {}
-
-      if (timedOut) {
-        console.error(`yt-dlp timed out after ${YT_TIMEOUT_S}s for ${url}`);
-        cleanup();
-        if (!res.headersSent) res.status(504).json({ error: "Download timed out", category: "timeout", message: "The server took too long to build this file.", hint: "Try again; if it repeats, lower concurrency." });
         releaseSlot();
-        return;
-      }
-      if (!produced) {
-        console.error("yt-dlp failed (code " + code + "), no output. stderr:\n" + stderr);
-        const info = classifyDownloadError(stderr);
-        cleanup();
-        if (!res.headersSent) res.status(500).json({ error: "Conversion failed", category: info.category, message: info.message, hint: info.hint, detail: info.detail });
-        releaseSlot();
-        return;
-      }
-      if (code !== 0) console.warn("yt-dlp exited " + code + " but output exists; serving anyway. stderr:", stderr);
+      });
 
-      const verified = await verifyDownloadedOutput(produced, requested);
-      if (!verified.ok) {
-        console.error(`yt-dlp produced the wrong format for ${requested}: ${verified.detail}`);
-        cleanup();
-        if (!res.headersSent) res.status(500).json({ error: "Wrong output format", category: "wrong-output-format", message: `The server could not produce a valid ${requested.toUpperCase()} file.`, hint: "Check yt-dlp/FFmpeg versions and the VPS logs." });
-        releaseSlot();
-        return;
-      }
+      ytdlp.on("close", async (code) => {
+        clearTimeout(jobTimer);
+        if (aborted) { cleanup(); releaseSlot(); return; }
+        let produced = null;
+        try {
+          const dir = os.tmpdir();
+          const base = prefix + ".";
+          const extOf = (f) => f.slice(base.length).toLowerCase();
+          const files = fs.readdirSync(dir).filter((f) => f.startsWith(base) && !f.endsWith(".part"));
+          const pick = files.find((f) => extOf(f) === fmt.ext) || files.find((f) => extOf(f) === fmt.audioFormat);
+          if (pick) produced = path.join(dir, pick);
+        } catch (e) {}
 
-      const safeFile = `${safeTitle}.${fmt.ext}`;
-      res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
-      res.setHeader("Content-Type", fmt.mime);
-      res.setHeader("Accept-Ranges", "bytes");
-      try { res.setHeader("Content-Length", fs.statSync(produced).size); } catch (e) {}
+        // Retry with a fresh proxy on a bot-check when nothing was produced.
+        if (!timedOut && !produced && isBotCheckError(stderr) && attempt < YT_PROXY_RETRIES) {
+          console.warn(`[yt-retry] audio bot-check, retry ${attempt + 1}/${YT_PROXY_RETRIES}`);
+          return runAttempt(attempt + 1);
+        }
 
-      const stream = fs.createReadStream(produced);
-      stream.on("error", () => { cleanup(); if (!res.headersSent) res.status(500).json({ error: "Read failed" }); releaseSlot(); });
-      stream.on("close", cleanup);
-      stream.pipe(res);
-    });
+        if (timedOut) {
+          console.error(`yt-dlp timed out after ${YT_TIMEOUT_S}s for ${url}`);
+          cleanup();
+          if (!res.headersSent) res.status(504).json({ error: "Download timed out", category: "timeout", message: "The server took too long to build this file.", hint: "Try again; if it repeats, lower concurrency." });
+          releaseSlot();
+          return;
+        }
+        if (!produced) {
+          console.error("yt-dlp failed (code " + code + "), no output. stderr:\n" + stderr);
+          const info = classifyDownloadError(stderr);
+          cleanup();
+          if (!res.headersSent) res.status(500).json({ error: "Conversion failed", category: info.category, message: info.message, hint: info.hint, detail: info.detail });
+          releaseSlot();
+          return;
+        }
+        if (code !== 0) console.warn("yt-dlp exited " + code + " but output exists; serving anyway. stderr:", stderr);
 
-    req.on("aborted", () => { if (ytdlp.exitCode === null) ytdlp.kill(); cleanup(); releaseSlot(); });
-    res.on("close", () => { if (!res.writableEnded && ytdlp.exitCode === null) ytdlp.kill(); if (!res.writableEnded) cleanup(); });
+        const verified = await verifyDownloadedOutput(produced, requested);
+        if (!verified.ok) {
+          console.error(`yt-dlp produced the wrong format for ${requested}: ${verified.detail}`);
+          cleanup();
+          if (!res.headersSent) res.status(500).json({ error: "Wrong output format", category: "wrong-output-format", message: `The server could not produce a valid ${requested.toUpperCase()} file.`, hint: "Check yt-dlp/FFmpeg versions and the VPS logs." });
+          releaseSlot();
+          return;
+        }
+
+        const safeFile = `${safeTitle}.${fmt.ext}`;
+        res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
+        res.setHeader("Content-Type", fmt.mime);
+        res.setHeader("Accept-Ranges", "bytes");
+        try { res.setHeader("Content-Length", fs.statSync(produced).size); } catch (e) {}
+
+        const stream = fs.createReadStream(produced);
+        stream.on("error", () => { cleanup(); if (!res.headersSent) res.status(500).json({ error: "Read failed" }); releaseSlot(); });
+        stream.on("close", cleanup);
+        stream.pipe(res);
+      });
+    };
+
+    req.on("aborted", () => { aborted = true; if (current && current.exitCode === null) current.kill(); cleanup(); releaseSlot(); });
+    res.on("close", () => { if (!res.writableEnded) { aborted = true; if (current && current.exitCode === null) current.kill(); cleanup(); } });
+
+    runAttempt(0);
   });
 
   if (!accepted) {
@@ -643,8 +686,8 @@ router.get("/yt-video-info", (req, res) => {
   }
   const url = normalizeYouTubeUrl(raw);
 
-  const args = ["-J", "--no-warnings", "--no-playlist", "--cache-dir", YTDLP_CACHE_DIR, ...ytdlpCookieArgs(), url];
-  execFile(YTDLP_BIN, args, { timeout: 45000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+  const buildArgs = () => ["-J", "--no-warnings", "--no-playlist", "--cache-dir", YTDLP_CACHE_DIR, ...ytdlpCookieArgs(), url];
+  execYtdlp(buildArgs, { timeout: 45000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
       console.error("yt-dlp yt-video-info error:", stderr);
       const info = classifyDownloadError(stderr);
@@ -732,96 +775,111 @@ router.get("/yt-video-download", (req, res) => {
     const releaseSlot = () => { if (slotReleased) return; slotReleased = true; release(); };
 
     const outTemplate = path.join(workDir, "out.%(ext)s");
-
-    const ytdlp = spawn(YTDLP_BIN, [
-      "-f", videoFormatSelector(quality),
-      "--merge-output-format", "mp4",
-      // Real MP4 with the moov atom at the front so it plays everywhere and can
-      // start playing before it is fully downloaded.
-      "--postprocessor-args", "ffmpeg:-movflags +faststart -threads 0",
-      "--concurrent-fragments", String(YTDLP_FRAGMENTS),
-      "--retries", "3",
-      "--fragment-retries", "5",
-      "--cache-dir", YTDLP_CACHE_DIR,
-      // Keep every intermediate fragment inside our throwaway work dir.
-      "--paths", "temp:" + workDir,
-      ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
-      ...ytdlpCookieArgs(),
-      "--no-mtime",
-      "-o", outTemplate,
-      "--no-playlist",
-      "--no-progress",
-      url,
-    ]);
-
-    let stderr = "";
-    let timedOut = false;
     let finished = false;
+    let current = null;
+    let aborted = false;
+    const finish = () => { if (finished) return; finished = true; cleanup(); releaseSlot(); };
 
-    const finish = () => { if (finished) return; finished = true; clearTimeout(jobTimer); cleanup(); releaseSlot(); };
+    const runAttempt = (attempt) => {
+      if (aborted) { finish(); return; }
+      // Clear any partial output left by a previous attempt.
+      try { for (const f of fs.readdirSync(workDir)) fs.rmSync(path.join(workDir, f), { recursive: true, force: true }); } catch (e) {}
 
-    // Overall ceiling: kill a build that runs too long.
-    const jobTimer = setTimeout(() => { timedOut = true; if (ytdlp.exitCode === null) ytdlp.kill("SIGKILL"); }, YT_TIMEOUT_S * 1000);
+      const ytdlp = spawn(YTDLP_BIN, [
+        "-f", videoFormatSelector(quality),
+        "--merge-output-format", "mp4",
+        // Real MP4 with the moov atom at the front so it plays everywhere and can
+        // start playing before it is fully downloaded.
+        "--postprocessor-args", "ffmpeg:-movflags +faststart -threads 0",
+        "--concurrent-fragments", String(YTDLP_FRAGMENTS),
+        "--retries", "3",
+        "--fragment-retries", "5",
+        "--cache-dir", YTDLP_CACHE_DIR,
+        // Keep every intermediate fragment inside our throwaway work dir.
+        "--paths", "temp:" + workDir,
+        ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
+        ...ytdlpCookieArgs(),
+        "--no-mtime",
+        "-o", outTemplate,
+        "--no-playlist",
+        "--no-progress",
+        url,
+      ]);
+      current = ytdlp;
 
-    ytdlp.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 65536) stderr = stderr.slice(-65536); });
+      let stderr = "";
+      let timedOut = false;
+      const jobTimer = setTimeout(() => { timedOut = true; if (ytdlp.exitCode === null) ytdlp.kill("SIGKILL"); }, YT_TIMEOUT_S * 1000);
 
-    ytdlp.on("error", (err) => {
-      clearTimeout(jobTimer);
-      console.error("yt video spawn error:", err);
-      if (!res.headersSent) {
-        if (err && err.code === "ENOENT") {
-          res.status(500).json({ error: "Download failed", category: "ytdlp-missing", message: "yt-dlp isn't installed or isn't on the server's PATH.", hint: "Install yt-dlp (or set YTDLP_PATH) and restart." });
+      ytdlp.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 65536) stderr = stderr.slice(-65536); });
+
+      ytdlp.on("error", (err) => {
+        clearTimeout(jobTimer);
+        console.error("yt video spawn error:", err);
+        if (!res.headersSent) {
+          if (err && err.code === "ENOENT") {
+            res.status(500).json({ error: "Download failed", category: "ytdlp-missing", message: "yt-dlp isn't installed or isn't on the server's PATH.", hint: "Install yt-dlp (or set YTDLP_PATH) and restart." });
+          } else {
+            res.status(500).json({ error: "Download failed", category: "spawn", message: "The server couldn't start the download process.", hint: "Check the server logs." });
+          }
         } else {
-          res.status(500).json({ error: "Download failed", category: "spawn", message: "The server couldn't start the download process.", hint: "Check the server logs." });
+          try { res.end(); } catch (e) {}
         }
-      } else {
-        try { res.end(); } catch (e) {}
-      }
-      finish();
-    });
-
-    ytdlp.on("close", (code) => {
-      clearTimeout(jobTimer);
-      // Find the finished MP4 in the work dir.
-      let produced = null;
-      try {
-        const files = fs.readdirSync(workDir).filter((f) => f.startsWith("out.") && !f.endsWith(".part"));
-        const pick = files.find((f) => f.toLowerCase().endsWith(".mp4")) || files[0];
-        if (pick) produced = path.join(workDir, pick);
-      } catch (e) {}
-
-      if (timedOut) {
-        console.error(`yt-dlp (video) timed out for ${url}`);
-        if (!res.headersSent) res.status(504).json({ error: "Download timed out", category: "timeout", message: "The server took too long to build this video.", hint: "Try a lower quality; if it repeats, lower concurrency." });
         finish();
-        return;
-      }
-      if (!produced) {
-        console.error("yt-dlp (video) failed (code " + code + "), no output. stderr:\n" + stderr);
-        const info = classifyDownloadError(stderr);
-        if (!res.headersSent) res.status(500).json({ error: "Download failed", category: info.category, message: info.message, hint: info.hint, detail: info.detail });
-        finish();
-        return;
-      }
-      if (code !== 0) console.warn("yt-dlp (video) exited " + code + " but output exists; serving anyway.");
+      });
 
-      // Serve the real MP4 with a correct Content-Length → accurate progress bar.
-      const safeFile = `${safeTitle}.mp4`;
-      res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
-      res.setHeader("Content-Type", "video/mp4");
-      res.setHeader("Cache-Control", "no-store");
-      res.setHeader("Accept-Ranges", "bytes");
-      try { res.setHeader("Content-Length", fs.statSync(produced).size); } catch (e) {}
+      ytdlp.on("close", (code) => {
+        clearTimeout(jobTimer);
+        if (aborted) { finish(); return; }
+        // Find the finished MP4 in the work dir.
+        let produced = null;
+        try {
+          const files = fs.readdirSync(workDir).filter((f) => f.startsWith("out.") && !f.endsWith(".part"));
+          const pick = files.find((f) => f.toLowerCase().endsWith(".mp4")) || files[0];
+          if (pick) produced = path.join(workDir, pick);
+        } catch (e) {}
 
-      const stream = fs.createReadStream(produced);
-      stream.on("error", () => { if (!res.headersSent) res.status(500).json({ error: "Read failed" }); finish(); });
-      stream.on("close", finish);
-      stream.pipe(res);
-    });
+        // Retry with a fresh proxy on a bot-check when nothing was produced.
+        if (!timedOut && !produced && isBotCheckError(stderr) && attempt < YT_PROXY_RETRIES) {
+          console.warn(`[yt-retry] video bot-check, retry ${attempt + 1}/${YT_PROXY_RETRIES}`);
+          return runAttempt(attempt + 1);
+        }
+
+        if (timedOut) {
+          console.error(`yt-dlp (video) timed out for ${url}`);
+          if (!res.headersSent) res.status(504).json({ error: "Download timed out", category: "timeout", message: "The server took too long to build this video.", hint: "Try a lower quality; if it repeats, lower concurrency." });
+          finish();
+          return;
+        }
+        if (!produced) {
+          console.error("yt-dlp (video) failed (code " + code + "), no output. stderr:\n" + stderr);
+          const info = classifyDownloadError(stderr);
+          if (!res.headersSent) res.status(500).json({ error: "Download failed", category: info.category, message: info.message, hint: info.hint, detail: info.detail });
+          finish();
+          return;
+        }
+        if (code !== 0) console.warn("yt-dlp (video) exited " + code + " but output exists; serving anyway.");
+
+        // Serve the real MP4 with a correct Content-Length → accurate progress bar.
+        const safeFile = `${safeTitle}.mp4`;
+        res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
+        res.setHeader("Content-Type", "video/mp4");
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("Accept-Ranges", "bytes");
+        try { res.setHeader("Content-Length", fs.statSync(produced).size); } catch (e) {}
+
+        const stream = fs.createReadStream(produced);
+        stream.on("error", () => { if (!res.headersSent) res.status(500).json({ error: "Read failed" }); finish(); });
+        stream.on("close", finish);
+        stream.pipe(res);
+      });
+    };
 
     // Client went away → stop the work immediately.
-    req.on("aborted", () => { if (ytdlp.exitCode === null) ytdlp.kill("SIGKILL"); finish(); });
-    res.on("close", () => { if (!res.writableEnded && ytdlp.exitCode === null) ytdlp.kill("SIGKILL"); finish(); });
+    req.on("aborted", () => { aborted = true; if (current && current.exitCode === null) current.kill("SIGKILL"); finish(); });
+    res.on("close", () => { if (!res.writableEnded) { aborted = true; if (current && current.exitCode === null) current.kill("SIGKILL"); } finish(); });
+
+    runAttempt(0);
   });
 
   if (!accepted) {
@@ -847,9 +905,9 @@ router.get("/yt-search", (req, res) => {
   // execFile (no shell is spawned), so the query text can never inject arguments
   // or shell metacharacters — it is handled verbatim by yt-dlp.
   const spec = `ytsearch${limit}:${q}`;
-  const args = ["-J", "--flat-playlist", "--no-warnings", "--cache-dir", YTDLP_CACHE_DIR, ...ytdlpCookieArgs(), spec];
+  const buildArgs = () => ["-J", "--flat-playlist", "--no-warnings", "--cache-dir", YTDLP_CACHE_DIR, ...ytdlpCookieArgs(), spec];
 
-  execFile(YTDLP_BIN, args, { timeout: 30000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+  execYtdlp(buildArgs, { timeout: 30000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
       console.error("yt-dlp yt-search error:", stderr);
       const info = classifyDownloadError(stderr);
