@@ -39,7 +39,55 @@ const router = express.Router();
 const YTDLP_BIN = process.env.YTDLP_PATH || "yt-dlp";
 const FFMPEG_LOCATION = process.env.FFMPEG_LOCATION || "";
 const YTDLP_CACHE_DIR = process.env.YTDLP_CACHE_DIR || path.join(os.tmpdir(), "yt-dlp-cache");
-const YTDLP_FRAGMENTS = Math.max(1, parseInt(process.env.YTDLP_FRAGMENTS || "4", 10) || 4);
+const YTDLP_FRAGMENTS = Math.max(1, parseInt(process.env.YTDLP_FRAGMENTS || "8", 10) || 8);
+
+// ── Speed: default extractor client ───────────────────────────────────────────
+// Used by ytdlpCookieArgs() when YTDLP_EXTRACTOR_ARGS is NOT set on the VPS. The
+// default "web" client makes yt-dlp fetch and run YouTube's player JS to solve
+// the n-signature challenge — slow, and its stream URLs are often throttled.
+// Keeping "default" first preserves every format, while android/web_safari add
+// faster, un-throttled paths. If you configure YTDLP_EXTRACTOR_ARGS (e.g. for a
+// PO-token provider) your value wins and this default is ignored.
+const DEFAULT_EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS
+  ? "" // handled in ytdlpCookieArgs — avoid double-adding
+  : "youtube:player_client=default,android,web_safari";
+
+// ── Speed: aria2c external downloader ─────────────────────────────────────────
+// aria2c opens many parallel connections per stream (typically 3–10× faster than
+// yt-dlp's native downloader). Auto-enabled when aria2c is found on PATH; force
+// on with YTDLP_ARIA2=1 or off with YTDLP_ARIA2=0. Both download routes build to
+// a temp file (not stdout), so aria2c is safe for audio and video alike.
+const ARIA2_AVAILABLE = (() => {
+  try { require("child_process").execFileSync("aria2c", ["--version"], { stdio: "ignore" }); return true; }
+  catch (e) { return false; }
+})();
+const USE_ARIA2 = process.env.YTDLP_ARIA2 === "1" || (process.env.YTDLP_ARIA2 !== "0" && ARIA2_AVAILABLE);
+const ARIA2_DL_ARGS = process.env.YTDLP_ARIA2_ARGS || "-x16 -s16 -k1M";
+function ytdlpDownloaderArgs() {
+  return USE_ARIA2 ? ["--downloader", "aria2c", "--downloader-args", "aria2c:" + ARIA2_DL_ARGS] : [];
+}
+
+// ── Speed: in-memory info cache (keyed by normalized URL) ─────────────────────
+// The slow part of a paste/search is the yt-dlp -J metadata extraction. Caching
+// the computed response briefly makes repeat lookups — and everyone pasting the
+// same trending link — effectively instant. TTL via YT_INFO_CACHE_TTL_S
+// (default 30 min); set it to 0 to disable caching entirely.
+const INFO_TTL_MS = Math.max(0, parseInt(process.env.YT_INFO_CACHE_TTL_S || "1800", 10) || 1800) * 1000;
+const INFO_CACHE_MAX = 500;
+const infoCache = new Map();
+function infoCacheGet(key) {
+  if (!INFO_TTL_MS) return null;
+  const e = infoCache.get(key);
+  if (!e) return null;
+  if (Date.now() - e.t > INFO_TTL_MS) { infoCache.delete(key); return null; }
+  infoCache.delete(key); infoCache.set(key, e); // refresh LRU recency
+  return e.data;
+}
+function infoCacheSet(key, data) {
+  if (!INFO_TTL_MS) return;
+  infoCache.set(key, { t: Date.now(), data });
+  if (infoCache.size > INFO_CACHE_MAX) infoCache.delete(infoCache.keys().next().value);
+}
 
 // Same shared-default secret as server.js so the WordPress plugins' signed links
 // validate immediately. Override with SCLOUD_API_SECRET on both sides for security.
@@ -54,7 +102,10 @@ const SIG_LEEWAY_S = Math.max(0, parseInt(process.env.SIG_LEEWAY_S || "600", 10)
 
 // Bound concurrent YouTube jobs so the box stays responsive; Pro ("priority")
 // links jump the queue. Independent of server.js's SoundCloud queue.
-const YT_MAX_CONCURRENT = Math.max(1, parseInt(process.env.YT_MAX_CONCURRENT || process.env.MAX_CONCURRENT || "2", 10) || 2);
+// Default concurrency scales with CPU cores (2–4) so several visitors aren't
+// queued behind one job on a multi-core box; still overridable via env.
+const YT_CONCURRENCY_DEFAULT = String(Math.max(2, Math.min((os.cpus() || []).length || 2, 4)));
+const YT_MAX_CONCURRENT = Math.max(1, parseInt(process.env.YT_MAX_CONCURRENT || process.env.MAX_CONCURRENT || YT_CONCURRENCY_DEFAULT, 10) || 2);
 const YT_MAX_QUEUE = Math.max(1, parseInt(process.env.YT_MAX_QUEUE || process.env.MAX_QUEUE || "30", 10) || 30);
 const YT_TIMEOUT_S = Math.max(60, parseInt(process.env.YT_DOWNLOAD_TIMEOUT_S || process.env.DOWNLOAD_TIMEOUT_S || "900", 10) || 900);
 
@@ -399,7 +450,7 @@ function ytdlpCookieArgs() {
   // bot-check tuning needs no code change. Multiple groups separated by ";;",
   // each passed as its own --extractor-args flag, e.g.:
   //   youtube:player_client=default,mweb,tv;;youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416
-  const extra = process.env.YTDLP_EXTRACTOR_ARGS || "";
+  const extra = process.env.YTDLP_EXTRACTOR_ARGS || DEFAULT_EXTRACTOR_ARGS;
   if (extra) {
     for (const part of extra.split(";;")) {
       const v = part.trim();
@@ -475,6 +526,10 @@ router.get("/yt-info", (req, res) => {
   const url = normalizeYouTubeUrl(raw);
   const playlist = isYouTubePlaylistUrl(url);
 
+  const cacheKey = "i:" + url;
+  const cached = infoCacheGet(cacheKey);
+  if (cached) return res.json(cached);
+
   const buildArgs = () => {
     const args = ["-J", "--no-warnings", "--cache-dir", YTDLP_CACHE_DIR, ...ytdlpCookieArgs()];
     args.push(playlist ? "--flat-playlist" : "--no-playlist");
@@ -494,7 +549,7 @@ router.get("/yt-info", (req, res) => {
 
     if (Array.isArray(meta.entries)) {
       const tracks = meta.entries.filter((e) => e && (e.url || e.id || e.webpage_url)).map(flatTrackShape);
-      return res.json({
+      const payload = {
         type: "playlist",
         header: {
           playlist_title: meta.title || "Playlist",
@@ -504,10 +559,12 @@ router.get("/yt-info", (req, res) => {
         },
         total: meta.playlist_count || tracks.length,
         tracks,
-      });
+      };
+      infoCacheSet(cacheKey, payload);
+      return res.json(payload);
     }
 
-    res.json({
+    const payload = {
       type: "single",
       title: meta.title,
       uploader: meta.uploader || meta.channel || "",
@@ -516,7 +573,9 @@ router.get("/yt-info", (req, res) => {
       view_count: meta.view_count,
       like_count: meta.like_count,
       url: meta.webpage_url || url,
-    });
+    };
+    infoCacheSet(cacheKey, payload);
+    res.json(payload);
   });
 });
 
@@ -569,6 +628,7 @@ router.get("/yt-download", (req, res) => {
 
       const ytdlp = spawn(YTDLP_BIN, [
         ...buildYtdlpArgs(fmt, opts),
+        ...ytdlpDownloaderArgs(),
         "--concurrent-fragments", String(YTDLP_FRAGMENTS),
         "--retries", "3",
         "--fragment-retries", "5",
@@ -686,6 +746,10 @@ router.get("/yt-video-info", (req, res) => {
   }
   const url = normalizeYouTubeUrl(raw);
 
+  const cacheKey = "v:" + url;
+  const cached = infoCacheGet(cacheKey);
+  if (cached) return res.json(cached);
+
   const buildArgs = () => ["-J", "--no-warnings", "--no-playlist", "--cache-dir", YTDLP_CACHE_DIR, ...ytdlpCookieArgs(), url];
   execYtdlp(buildArgs, { timeout: 45000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
@@ -728,7 +792,7 @@ router.get("/yt-video-info", (req, res) => {
       .sort((a, b) => b - a)
       .map((h) => ({ height: h, label: h + "p", ext: "mp4", size: tiers.get(h) || 0 }));
 
-    res.json({
+    const payload = {
       type: "single",
       title: meta.title,
       uploader: meta.uploader || meta.channel || "",
@@ -737,7 +801,9 @@ router.get("/yt-video-info", (req, res) => {
       view_count: meta.view_count,
       url: meta.webpage_url || url,
       qualities,
-    });
+    };
+    infoCacheSet(cacheKey, payload);
+    res.json(payload);
   });
 });
 
@@ -788,6 +854,7 @@ router.get("/yt-video-download", (req, res) => {
       const ytdlp = spawn(YTDLP_BIN, [
         "-f", videoFormatSelector(quality),
         "--merge-output-format", "mp4",
+        ...ytdlpDownloaderArgs(),
         // Real MP4 with the moov atom at the front so it plays everywhere and can
         // start playing before it is fully downloaded.
         "--postprocessor-args", "ffmpeg:-movflags +faststart -threads 0",
@@ -981,6 +1048,11 @@ router.get("/yt-diag", (req, res) => {
     ytdlpPath: YTDLP_BIN,
     ffmpegLocation: FFMPEG_LOCATION || "(PATH)",
     secret: API_SECRET ? "set" : "open",
+    // Performance knobs
+    extractorArgs: (process.env.YTDLP_EXTRACTOR_ARGS || DEFAULT_EXTRACTOR_ARGS) || "(default web client)",
+    aria2c: USE_ARIA2 ? "on" : (ARIA2_AVAILABLE ? "available (disabled)" : "not installed"),
+    fragments: YTDLP_FRAGMENTS,
+    infoCache: INFO_TTL_MS ? { ttlSeconds: INFO_TTL_MS / 1000, entries: infoCache.size } : "disabled",
   });
 });
 

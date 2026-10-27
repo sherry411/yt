@@ -85,3 +85,51 @@ It exits non-zero if the website loops/returns an error, the API is down, or yt-
 - M4A is now 128 kbps AAC. A roughly 3 minute 20 second track should usually be near 3.1–3.4 MB, plus small container overhead.
 - WAV is uncompressed PCM, so roughly 34 MB for that duration is normal.
 - Extracting FLAC from a lossy YouTube stream does not restore lost quality and often creates a very large FLAC (around the reported 32 MB) because lossy artifacts compress poorly. This is expected codec behavior, not a wrong-format result.
+
+## Performance & accuracy tuning (1.7.0)
+
+The YouTube routes ship fast, sensible defaults; the items below squeeze out the rest. Check what's active any time with `GET /yt-diag`.
+
+### 1. Install aria2c (biggest download-speed win)
+
+aria2c parallelises each stream (3–10× faster transfers). It's **auto-detected** — once it's on PATH the backend uses it automatically; no config needed.
+
+```bash
+sudo apt-get update && sudo apt-get install -y aria2
+```
+
+- Force on/off: `YTDLP_ARIA2=1` / `YTDLP_ARIA2=0`
+- Tune connections: `YTDLP_ARIA2_ARGS="-x16 -s16 -k1M"` (default)
+
+### 2. Keep yt-dlp fresh (biggest accuracy win)
+
+A stale yt-dlp is the #1 cause of broken/empty/wrong extractions — YouTube changes often. Update it on a schedule and restart:
+
+```bash
+# one-off
+yt-dlp -U        # or: pip install -U yt-dlp
+
+# nightly cron (3:17 AM), then reload under PM2
+17 3 * * *  yt-dlp -U >/dev/null 2>&1; pm2 restart trackgrab-backend
+```
+
+A ready-made helper is included: `bash update-ytdlp.sh` (updates yt-dlp and reloads PM2 if present).
+
+### 3. Extractor client
+
+Default when `YTDLP_EXTRACTOR_ARGS` is unset: `youtube:player_client=default,android,web_safari` — avoids the throttled `web`-client stream URLs while keeping every format. Set `YTDLP_EXTRACTOR_ARGS` to override (e.g. to point at a PO-token provider); your value then wins.
+
+### 4. Cookies (reliability / fewer bot-checks)
+
+Drop a Netscape-format `cookies.txt` next to the app (it's gitignored) and restart — no config edit needed. Or set `YTDLP_COOKIES=/path/cookies.txt` / `YTDLP_COOKIES_FROM_BROWSER=chrome`. This clears most "Sign in to confirm you're not a bot" failures.
+
+### 5. Throughput knobs (env)
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `YT_INFO_CACHE_TTL_S` | `1800` | How long `/yt-info` + `/yt-video-info` responses are cached (`0` disables). |
+| `YTDLP_FRAGMENTS` | `8` | Parallel DASH fragment downloads (native downloader). |
+| `YT_MAX_CONCURRENT` | CPU cores (2–4) | Simultaneous download jobs before queueing. |
+| `YTDLP_ARIA2` | auto | `1`/`0` to force the aria2c downloader on/off. |
+
+See `.env.example` for the full list.

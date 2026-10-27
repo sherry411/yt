@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.7.0
+
+Performance & accuracy pass for the YouTube routes (speed + reliability; no API or response-shape changes):
+
+- **In-memory info cache.** `/yt-info` and `/yt-video-info` now cache the computed response, keyed by the normalized URL, so repeat lookups (and everyone pasting the same trending link) skip the slow `yt-dlp -J` extraction and return instantly. TTL via `YT_INFO_CACHE_TTL_S` (default 1800s; `0` disables). LRU-bounded to 500 entries.
+- **aria2c external downloader (auto-detected).** When `aria2c` is on PATH, both download routes use it (`-x16 -s16 -k1M`) for typically 3–10× faster transfers; falls back to yt-dlp's native downloader when absent. Force with `YTDLP_ARIA2=1` / disable with `YTDLP_ARIA2=0`; tune with `YTDLP_ARIA2_ARGS`. Both routes build to a temp file, so aria2c is safe for audio and video.
+- **Faster default extractor client.** When `YTDLP_EXTRACTOR_ARGS` is not set, the router now defaults to `youtube:player_client=default,android,web_safari`. The `web` client has to run YouTube's player JS (slow, and its stream URLs are frequently throttled); keeping `default` first preserves every format while android/web_safari add faster, un-throttled paths. A configured `YTDLP_EXTRACTOR_ARGS` (e.g. a PO-token provider) still wins.
+- **Higher default parallelism.** `YTDLP_FRAGMENTS` default 4 → 8, and `YT_MAX_CONCURRENT` now defaults to the CPU-core count (2–4) instead of a flat 2. Both remain overridable via env.
+- **`/yt-diag`** now also reports `extractorArgs`, `aria2c`, `fragments`, and `infoCache` so the active tuning is visible at a glance.
+
 ## 1.6.2
 
 - `/yt-video-info` now returns an estimated download `size` (bytes) for each quality tier — the best video stream at that tier plus the best audio — so the WordPress video tool can show total size and a real percentage during a streamed download.
