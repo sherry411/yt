@@ -41,6 +41,12 @@ Shares your existing env. Notable ones:
 - `SCLOUD_API_SECRET` — **must equal** the "Shared API secret" set in both
   WordPress plugins. Always set a fresh value in production; never rely on the
   compatibility fallback embedded in older packages.
+- Reliability / speed knobs added in 1.8.0 (all optional): `YTDLP_AUTO_UPDATE`,
+  `YTDLP_STALE_DAYS`, `YTDLP_FALLBACK_EXTRACTOR_ARGS`, `YT_MAX_DURATION_S`,
+  `YT_INFO_MAX_CONCURRENT`, `YT_INFO_CACHE_MAX`, `YT_PLAYLIST_CACHE_S`,
+  `YT_SEARCH_CACHE_S`, `YT_SUGGEST_CACHE_S`, `YT_FAST_SEARCH` — see `.env.example`
+  and the 1.8.0 section of `CHANGELOG.md`. `GET /yt-diag` shows yt-dlp's version
+  and age, the lookup load and the cache counters.
 - `YT_MAX_CONCURRENT` (default 2), `YT_MAX_QUEUE` (30), `YT_DOWNLOAD_TIMEOUT_S` (900).
 - `YTDLP_COOKIES` (path to a cookies.txt) or `YTDLP_COOKIES_FROM_BROWSER` —
   optional, helps with age-restricted videos or "sign in to confirm you're not a bot".

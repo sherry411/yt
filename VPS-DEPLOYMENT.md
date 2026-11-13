@@ -110,7 +110,7 @@ A stale yt-dlp is the #1 cause of broken/empty/wrong extractions — YouTube cha
 yt-dlp -U        # or: pip install -U yt-dlp
 
 # nightly cron (3:17 AM), then reload under PM2
-17 3 * * *  yt-dlp -U >/dev/null 2>&1; pm2 restart trackgrab-backend
+17 3 * * *  yt-dlp -U >/dev/null 2>&1; pm2 restart trackgrab
 ```
 
 A ready-made helper is included: `bash update-ytdlp.sh` (updates yt-dlp and reloads PM2 if present).

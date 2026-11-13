@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.8.0 — reliability + second speed pass
+
+Only `youtube.js` has code changes. No route, parameter, signature or CORS change; success responses keep their shape. The WordPress plugins need no update.
+
+### Fixed
+- **720p / 1080p requests were delivered as 360p.** The quality selector tried "one ready-made MP4" first, and YouTube only offers that at 360p now. It now takes the best video at or below the requested height plus the best audio, preferring H.264 + AAC so the MP4 plays everywhere. Above 1080p YouTube has no H.264, so those tiers are VP9/AV1 inside the MP4. Real-resolution files are larger and take longer than the 360p ones that were being sent before.
+- **Live streams and unfinished premieres** are refused up front with a clear `category: "live"` error (lookup: HTTP 400; download: yt-dlp `--match-filter`), instead of recording until the 15-minute job timeout.
+- **Cut-off files.** Downloads now pass `--abort-on-unavailable-fragments`, so a missing fragment fails the job instead of silently producing a truncated file.
+- **Stranded YouTube temp files.** The existing sweeper only knew the SoundCloud prefixes; `ytgrab-*` / `ytgrabv-*` leftovers from crashes or restarts are now removed once they are older than twice the job timeout (min. 1 h).
+- **Unread yt-dlp stdout** in both download routes is now drained.
+- The 1.7.0 cache keyed on the full URL, so `youtu.be/ID`, `watch?v=ID`, `/shorts/ID` and the audio/video tools each paid their own extraction. One per-video cache now serves all of them.
+- Docs/scripts restarted a PM2 app called `trackgrab-backend`; the app in `ecosystem.config.cjs` is `trackgrab`.
+
+### Reliability
+- **One extra attempt on retryable failures** (network blip, HTTP 403 on the media request, extractor hiccup) for lookups, searches and downloads — with a fresh proxy, a fresh extraction and fallback client settings: `YTDLP_FALLBACK_EXTRACTOR_ARGS` if set, otherwise yt-dlp's own default clients when `YTDLP_EXTRACTOR_ARGS` is not configured. Deterministic failures (private, removed, region, age-gate) are not retried.
+- **Clearer errors.** New categories next to the existing ones: `live`, `too-long`, `drm`, `blocked` (YouTube refused the media request), `network`, `busy`. Same JSON fields as before (`error`/`category`/`message`/`hint`/`detail`).
+- **yt-dlp freshness.** Version and age are checked at start and every 12 h, a warning is logged when it is older than `YTDLP_STALE_DAYS` (45), and `/yt-diag` reports it. `YTDLP_AUTO_UPDATE=1` also runs `yt-dlp -U` on that schedule (standalone yt-dlp file only; pip installs use `update-ytdlp.sh`).
+- **Lookup load guard.** At most `YT_INFO_MAX_CONCURRENT` (6) metadata/search yt-dlp processes run at once; up to `YT_INFO_MAX_WAITING` (60) wait, beyond that the answer is a clean "server busy".
+- **Optional length cap.** `YT_MAX_DURATION_S` (0 = off) rejects over-length videos with `category: "too-long"`.
+- **Request log.** Each download request ends with one JSON line (`evt`, video id, format/quality, status, bytes, ms) for `pm2 logs`.
+
+### Speed
+- **Downloads skip the second extraction.** The metadata from the info lookup is kept on disk (`<tmp>/ytgrab-infocache`, wiped at start, max `YT_INFO_CACHE_MAX` = 200 videos) and handed back to yt-dlp with `--load-info-json`, through the same proxy the lookup used. If it is rejected the job re-runs the normal way automatically.
+- Simultaneous lookups of one video collapse into a single yt-dlp run. Playlists are cached for `YT_PLAYLIST_CACHE_S` (300 s).
+- **Search**: cached (`YT_SEARCH_CACHE_S`, 600 s); an uncached search is one direct HTTPS request to YouTube's search endpoint, falling back to yt-dlp `ytsearch` on any failure. `YT_FAST_SEARCH=0` forces yt-dlp. The direct request does not use the proxy pool.
+- **Suggestions**: cached (`YT_SUGGEST_CACHE_S`, 3600 s), kept-alive upstream connection, upstream wait capped at 2.5 s.
+- **M4A/MP4 audio** at bitrate 128 or unspecified uses YouTube's native AAC stream — no re-encode.
+- Finished files are streamed in 1 MB reads. `YT_INFO_CACHE_TTL_S` still works (`YT_INFO_CACHE_S` is an alias that wins if both are set).
+
 ## 1.7.0
 
 Performance & accuracy pass for the YouTube routes (speed + reliability; no API or response-shape changes):

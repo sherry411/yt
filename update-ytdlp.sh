@@ -32,7 +32,7 @@ fi
 # Reload the app so the new binary is picked up (PM2 if present; harmless if not).
 if command -v pm2 >/dev/null 2>&1; then
   echo "==> reloading PM2 app(s)"
-  pm2 restart trackgrab-backend 2>/dev/null || pm2 restart all 2>/dev/null || true
+  pm2 restart trackgrab 2>/dev/null || pm2 restart trackgrab-backend 2>/dev/null || pm2 restart all 2>/dev/null || true
 fi
 
 echo "==> done"
