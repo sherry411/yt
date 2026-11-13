@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.9.0 — instant browser hand-off
+
+- **Downloads register in the browser immediately.** When the browser navigates to a signed `/yt-download` or `/yt-video-download` link, the response headers are now sent as soon as the video is confirmed downloadable (metadata is normally already cached from the lookup) and the job is accepted — not after the whole file has been built. The browser's own download manager takes over at that moment, so the download keeps going if the visitor closes the tab or leaves the site. The bytes follow when the file is ready.
+- Trade-offs: the size is not known that early, so these responses have no `Content-Length` (the browser shows bytes received, no percentage); and a failure after the headers cuts the connection so the browser shows a failed download instead of saving an empty file.
+- Only real browser navigations get this (`Sec-Fetch-Mode: navigate`, or an HTML `Accept` header on older browsers). `fetch()`/XHR clients keep the previous behaviour exactly (`Content-Length`, JSON errors). `YT_EARLY_HEADERS=0` switches it off.
+- Errors that happen before the headers are shown to a navigating browser as a small readable page with a "Go back" button instead of raw JSON. API clients still get the same JSON.
+- `X-Accel-Buffering: no` is sent with the early headers so nginx passes them on at once.
+
 ## 1.8.0 — reliability + second speed pass
 
 Only `youtube.js` has code changes. No route, parameter, signature or CORS change; success responses keep their shape. The WordPress plugins need no update.

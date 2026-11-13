@@ -952,13 +952,101 @@ router.get("/yt-info", (req, res) => {
   });
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Instant browser hand-off (1.9.0)
+// ═════════════════════════════════════════════════════════════════════════════
+// The WordPress tool starts a download by pointing the browser at the signed
+// link. The browser only "owns" a download (so it survives closing the tab or
+// the whole site) once it has received the response HEADERS. Until 1.9.0 those
+// were sent only after the complete file had been built on the server, so
+// closing the page during that wait cancelled everything.
+//
+// Now, for a normal browser navigation, the headers go out as soon as the video
+// is known to be downloadable (metadata is usually already cached from the
+// lookup, so that is immediate) and the job is accepted. The browser shows the
+// download straight away; the bytes follow when the file is ready.
+//
+// Trade-offs, by design:
+//   • the size isn't known yet, so no Content-Length → the browser shows the
+//     amount received but no percentage / time left;
+//   • a failure after the headers can't be a JSON message any more — the
+//     connection is cut so the browser marks the download as failed instead of
+//     saving an empty file.
+// In-page fetch()/XHR clients are NOT affected: they keep the old behaviour
+// (Content-Length + JSON errors). YT_EARLY_HEADERS=0 turns the hand-off off.
+const YT_EARLY_HEADERS = process.env.YT_EARLY_HEADERS !== "0";
+
+// True for a top-level browser navigation (link click / address bar), false for
+// fetch()/XHR. Browsers without Sec-Fetch-* headers are recognised by Accept.
+function isNavigation(req) {
+  const mode = req.get("sec-fetch-mode");
+  if (mode) return mode === "navigate";
+  return /text\/html/i.test(req.get("accept") || "");
+}
+function wantsEarlyHeaders(req) {
+  return YT_EARLY_HEADERS && isNavigation(req);
+}
+
+function sendEarlyHeaders(res, fileName, mime) {
+  if (res.headersSent || res.destroyed) return false;
+  res.status(200);
+  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+  res.setHeader("Content-Type", mime);
+  res.setHeader("Cache-Control", "no-store");
+  // Tell nginx not to hold the headers / body back in its buffer.
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+  return true;
+}
+
+const htmlEscape = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// Report a download-route failure. Headers already sent → cut the connection
+// (failed download, never a silent empty file). A browser navigation gets a
+// small readable page instead of raw JSON; API clients get the same JSON as ever.
+function failDl(req, res, status, body) {
+  if (res.headersSent) { if (!res.writableEnded) res.destroy(); return; }
+  if (!isNavigation(req)) return res.status(status).json(body);
+  const title = htmlEscape(body.message || body.error || "Download failed");
+  const hint = htmlEscape(body.hint || "");
+  res.status(status).type("html").send(
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<meta name="robots" content="noindex"><title>Download could not start</title>` +
+    `<style>body{margin:0;font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f6f7f9;color:#1d2330;display:flex;min-height:100vh;align-items:center;justify-content:center}` +
+    `main{max-width:440px;margin:24px;padding:28px;background:#fff;border-radius:14px;box-shadow:0 6px 24px rgba(0,0,0,.08)}h1{font-size:20px;margin:0 0 10px}p{margin:0 0 18px;color:#556}` +
+    `button{font:inherit;padding:10px 18px;border:0;border-radius:9px;background:#1d2330;color:#fff;cursor:pointer}</style></head>` +
+    `<body><main><h1>${title}</h1>${hint ? `<p>${hint}</p>` : "<p>Please go back and try again.</p>"}` +
+    `<button type="button" onclick="if(history.length>1){history.back()}else{window.close()}">Go back</button></main></body></html>`
+  );
+}
+
+// Before committing to an early 200, make sure the video can actually be
+// downloaded (private / removed / live / age-gated are caught here and still get
+// a proper error). Uses the shared metadata cache, so right after a lookup this
+// costs nothing — and the metadata it fetches is reused by the download itself.
+function preflightThen(req, res, url, early, onOk, onFail) {
+  if (!early || !YT_INFO_CACHE_S) return onOk();
+  getVideoInfo(url, "download-preflight").then(
+    () => {
+      if (res.destroyed || req.destroyed) { onFail(); return; }
+      onOk();
+    },
+    (e) => {
+      onFail();
+      if (res.destroyed) return;
+      if (e && e.status && e.body) return failDl(req, res, e.status, Object.assign({ message: e.body.error }, e.body));
+      failDl(req, res, 500, { error: "Download failed", message: "The server couldn't prepare this download." });
+    }
+  );
+}
+
 // ── GET /yt-download ──────────────────────────────────────────────────────────
 router.get("/yt-download", (req, res) => {
   const raw = req.query.url;
   const title = req.query.title || "audio";
   const requested = String(req.query.format || "mp3").toLowerCase();
   const fmt = DOWNLOAD_FORMATS[requested];
-  if (!fmt) return res.status(400).json({ error: "Unsupported output format" });
+  if (!fmt) return failDl(req, res, 400, { error: "Unsupported output format" });
 
   const opts = { bitrate: normalizeBitrate(req.query.bitrate), meta: String(req.query.meta || "") === "1" };
   const priority = String(req.query.v || "") === "2" && String(req.query.priority || "") === "1";
@@ -966,13 +1054,16 @@ router.get("/yt-download", (req, res) => {
   const sigCheck = downloadSigCheck(req.query);
   if (!sigCheck.ok) {
     console.warn(`[yt-sig] rejected reason=${sigCheck.reason} exp=${req.query.exp || ""} now=${Math.floor(Date.now() / 1000)}`);
-    return res.status(403).json({ error: "Invalid or expired download link", code: "bad_link", reason: sigCheck.reason });
+    return failDl(req, res, 403, { error: "Invalid or expired download link", code: "bad_link", reason: sigCheck.reason });
   }
-  if (!raw || !isYouTubeUrl(raw)) return res.status(400).json({ error: "Invalid YouTube URL" });
+  if (!raw || !isYouTubeUrl(raw)) return failDl(req, res, 400, { error: "Invalid YouTube URL" });
   const url = normalizeYouTubeUrl(raw);
 
   const safeTitle = String(title).replace(/[^a-zA-Z0-9_\- ]/g, "").trim() || "audio";
-  logRequest(req, res, "yt-download", { video: videoCacheKey(url), format: requested, bitrate: opts.bitrate || "", priority });
+  const early = wantsEarlyHeaders(req);
+  let earlySent = false; // response headers already handed to the browser
+  let served = false;    // the finished file has started streaming
+  logRequest(req, res, "yt-download", { early, video: videoCacheKey(url), format: requested, bitrate: opts.bitrate || "", priority });
   const workId = crypto.randomBytes(8).toString("hex");
   const prefix = `ytgrab-${workId}`;
   const outTemplate = path.join(os.tmpdir(), `${prefix}.%(ext)s`);
@@ -986,10 +1077,15 @@ router.get("/yt-download", (req, res) => {
     } catch (e) {}
   }
 
-  const accepted = scheduleJob(priority, (release) => {
+  const startJob = () => scheduleJob(priority, (release) => {
     if (res.writableEnded || req.destroyed) { cleanup(); release(); return; }
     let slotReleased = false;
-    const releaseSlot = () => { if (slotReleased) return; slotReleased = true; release(); };
+    const releaseSlot = () => {
+      if (slotReleased) return;
+      slotReleased = true;
+      if (earlySent && !served && !res.writableEnded) res.destroy(); // failed → browser shows a failed download
+      release();
+    };
     res.on("finish", releaseSlot);
     res.on("close", releaseSlot);
 
@@ -1042,9 +1138,9 @@ router.get("/yt-download", (req, res) => {
         cleanup();
         if (!res.headersSent) {
           if (err && err.code === "ENOENT") {
-            res.status(500).json({ error: "Download failed", category: "ytdlp-missing", message: "yt-dlp isn't installed or isn't on the server's PATH.", hint: "Install yt-dlp (or set YTDLP_PATH) and restart." });
+            failDl(req, res, 500, { error: "Download failed", category: "ytdlp-missing", message: "yt-dlp isn't installed or isn't on the server's PATH.", hint: "Install yt-dlp (or set YTDLP_PATH) and restart." });
           } else {
-            res.status(500).json({ error: "Download failed", category: "spawn", message: "The server couldn't start the download process.", hint: "Check the server logs." });
+            failDl(req, res, 500, { error: "Download failed", category: "spawn", message: "The server couldn't start the download process.", hint: "Check the server logs." });
           }
         }
         releaseSlot();
@@ -1089,7 +1185,7 @@ router.get("/yt-download", (req, res) => {
         if (timedOut) {
           console.error(`yt-dlp timed out after ${YT_TIMEOUT_S}s for ${url}`);
           cleanup();
-          if (!res.headersSent) res.status(504).json({ error: "Download timed out", category: "timeout", message: "The server took too long to build this file.", hint: "Try again; if it repeats, lower concurrency." });
+          failDl(req, res, 504, { error: "Download timed out", category: "timeout", message: "The server took too long to build this file.", hint: "Try again; if it repeats, lower concurrency." });
           releaseSlot();
           return;
         }
@@ -1097,7 +1193,7 @@ router.get("/yt-download", (req, res) => {
           console.error("yt-dlp failed (code " + code + "), no output. stderr:\n" + stderr);
           const info = classifyDownloadError(stderr + "\n" + skipNoteFrom(stdoutTail));
           cleanup();
-          if (!res.headersSent) res.status(500).json({ error: "Conversion failed", category: info.category, message: info.message, hint: info.hint, detail: info.detail });
+          failDl(req, res, 500, { error: "Conversion failed", category: info.category, message: info.message, hint: info.hint, detail: info.detail });
           releaseSlot();
           return;
         }
@@ -1107,19 +1203,20 @@ router.get("/yt-download", (req, res) => {
         if (!verified.ok) {
           console.error(`yt-dlp produced the wrong format for ${requested}: ${verified.detail}`);
           cleanup();
-          if (!res.headersSent) res.status(500).json({ error: "Wrong output format", category: "wrong-output-format", message: `The server could not produce a valid ${requested.toUpperCase()} file.`, hint: "Check yt-dlp/FFmpeg versions and the VPS logs." });
+          failDl(req, res, 500, { error: "Wrong output format", category: "wrong-output-format", message: `The server could not produce a valid ${requested.toUpperCase()} file.`, hint: "Check yt-dlp/FFmpeg versions and the VPS logs." });
           releaseSlot();
           return;
         }
 
         const safeFile = `${safeTitle}.${fmt.ext}`;
-        res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
-        res.setHeader("Content-Type", fmt.mime);
-        res.setHeader("Accept-Ranges", "bytes");
-        try { res.setHeader("Content-Length", fs.statSync(produced).size); } catch (e) {}
+        if (!res.headersSent) res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
+        if (!res.headersSent) res.setHeader("Content-Type", fmt.mime);
+        if (!res.headersSent) res.setHeader("Accept-Ranges", "bytes");
+        try { if (!res.headersSent) res.setHeader("Content-Length", fs.statSync(produced).size); } catch (e) {}
 
+        served = true;
         const stream = fs.createReadStream(produced, { highWaterMark: 1024 * 1024 });
-        stream.on("error", () => { cleanup(); if (!res.headersSent) res.status(500).json({ error: "Read failed" }); releaseSlot(); });
+        stream.on("error", () => { cleanup(); failDl(req, res, 500, { error: "Read failed" }); releaseSlot(); });
         stream.on("close", cleanup);
         stream.pipe(res);
       });
@@ -1131,9 +1228,13 @@ router.get("/yt-download", (req, res) => {
     runAttempt(0, true);
   });
 
-  if (!accepted) {
-    return res.status(503).json({ error: "Server busy", category: "queue-full", message: "The download queue is full right now.", hint: "Please wait a moment and try again." });
-  }
+  preflightThen(req, res, url, early, () => {
+    if (startJob()) {
+      if (early) earlySent = sendEarlyHeaders(res, `${safeTitle}.${fmt.ext}`, fmt.mime);
+      return;
+    }
+    return failDl(req, res, 503, { error: "Server busy", category: "queue-full", message: "The download queue is full right now.", hint: "Please wait a moment and try again." });
+  }, cleanup);
 });
 
 // ── GET /yt-video-info ────────────────────────────────────────────────────────
@@ -1176,23 +1277,31 @@ router.get("/yt-video-download", (req, res) => {
   const sigCheck = videoSigCheck(req.query);
   if (!sigCheck.ok) {
     console.warn(`[yt-vsig] rejected reason=${sigCheck.reason} exp=${req.query.exp || ""} now=${Math.floor(Date.now() / 1000)}`);
-    return res.status(403).json({ error: "Invalid or expired download link", code: "bad_link", reason: sigCheck.reason });
+    return failDl(req, res, 403, { error: "Invalid or expired download link", code: "bad_link", reason: sigCheck.reason });
   }
-  if (!raw || !isYouTubeUrl(raw)) return res.status(400).json({ error: "Invalid YouTube URL" });
+  if (!raw || !isYouTubeUrl(raw)) return failDl(req, res, 400, { error: "Invalid YouTube URL" });
   const url = normalizeYouTubeUrl(raw);
 
   const safeTitle = String(title).replace(/[^a-zA-Z0-9_\- ]/g, "").trim() || "video";
-  logRequest(req, res, "yt-video-download", { video: videoCacheKey(url), quality: quality || "best", priority });
+  const early = wantsEarlyHeaders(req);
+  let earlySent = false; // response headers already handed to the browser
+  let served = false;    // the finished file has started streaming
+  logRequest(req, res, "yt-video-download", { early, video: videoCacheKey(url), quality: quality || "best", priority });
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "ytgrabv-"));
 
   function cleanup() {
     try { fs.rmSync(workDir, { recursive: true, force: true }); } catch (e) {}
   }
 
-  const accepted = scheduleJob(priority, (release) => {
+  const startJob = () => scheduleJob(priority, (release) => {
     if (res.writableEnded || req.destroyed) { cleanup(); release(); return; }
     let slotReleased = false;
-    const releaseSlot = () => { if (slotReleased) return; slotReleased = true; release(); };
+    const releaseSlot = () => {
+      if (slotReleased) return;
+      slotReleased = true;
+      if (earlySent && !served && !res.writableEnded) res.destroy(); // failed → browser shows a failed download
+      release();
+    };
 
     const outTemplate = path.join(workDir, "out.%(ext)s");
     let finished = false;
@@ -1252,12 +1361,12 @@ router.get("/yt-video-download", (req, res) => {
         console.error("yt video spawn error:", err);
         if (!res.headersSent) {
           if (err && err.code === "ENOENT") {
-            res.status(500).json({ error: "Download failed", category: "ytdlp-missing", message: "yt-dlp isn't installed or isn't on the server's PATH.", hint: "Install yt-dlp (or set YTDLP_PATH) and restart." });
+            failDl(req, res, 500, { error: "Download failed", category: "ytdlp-missing", message: "yt-dlp isn't installed or isn't on the server's PATH.", hint: "Install yt-dlp (or set YTDLP_PATH) and restart." });
           } else {
-            res.status(500).json({ error: "Download failed", category: "spawn", message: "The server couldn't start the download process.", hint: "Check the server logs." });
+            failDl(req, res, 500, { error: "Download failed", category: "spawn", message: "The server couldn't start the download process.", hint: "Check the server logs." });
           }
         } else {
-          try { res.end(); } catch (e) {}
+          try { res.destroy(); } catch (e) {}
         }
         finish();
       });
@@ -1298,14 +1407,14 @@ router.get("/yt-video-download", (req, res) => {
 
         if (timedOut) {
           console.error(`yt-dlp (video) timed out for ${url}`);
-          if (!res.headersSent) res.status(504).json({ error: "Download timed out", category: "timeout", message: "The server took too long to build this video.", hint: "Try a lower quality; if it repeats, lower concurrency." });
+          failDl(req, res, 504, { error: "Download timed out", category: "timeout", message: "The server took too long to build this video.", hint: "Try a lower quality; if it repeats, lower concurrency." });
           finish();
           return;
         }
         if (!produced) {
           console.error("yt-dlp (video) failed (code " + code + "), no output. stderr:\n" + stderr);
           const info = classifyDownloadError(stderr + "\n" + skipNoteFrom(stdoutTail));
-          if (!res.headersSent) res.status(500).json({ error: "Download failed", category: info.category, message: info.message, hint: info.hint, detail: info.detail });
+          failDl(req, res, 500, { error: "Download failed", category: info.category, message: info.message, hint: info.hint, detail: info.detail });
           finish();
           return;
         }
@@ -1313,14 +1422,15 @@ router.get("/yt-video-download", (req, res) => {
 
         // Serve the real MP4 with a correct Content-Length → accurate progress bar.
         const safeFile = `${safeTitle}.mp4`;
-        res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
-        res.setHeader("Content-Type", "video/mp4");
-        res.setHeader("Cache-Control", "no-store");
-        res.setHeader("Accept-Ranges", "bytes");
-        try { res.setHeader("Content-Length", fs.statSync(produced).size); } catch (e) {}
+        if (!res.headersSent) res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
+        if (!res.headersSent) res.setHeader("Content-Type", "video/mp4");
+        if (!res.headersSent) res.setHeader("Cache-Control", "no-store");
+        if (!res.headersSent) res.setHeader("Accept-Ranges", "bytes");
+        try { if (!res.headersSent) res.setHeader("Content-Length", fs.statSync(produced).size); } catch (e) {}
 
+        served = true;
         const stream = fs.createReadStream(produced, { highWaterMark: 1024 * 1024 });
-        stream.on("error", () => { if (!res.headersSent) res.status(500).json({ error: "Read failed" }); finish(); });
+        stream.on("error", () => { failDl(req, res, 500, { error: "Read failed" }); finish(); });
         stream.on("close", finish);
         stream.pipe(res);
       });
@@ -1333,10 +1443,14 @@ router.get("/yt-video-download", (req, res) => {
     runAttempt(0, true);
   });
 
-  if (!accepted) {
+  preflightThen(req, res, url, early, () => {
+    if (startJob()) {
+      if (early) earlySent = sendEarlyHeaders(res, `${safeTitle}.mp4`, "video/mp4");
+      return;
+    }
     cleanup();
-    return res.status(503).json({ error: "Server busy", category: "queue-full", message: "The download queue is full right now.", hint: "Please wait a moment and try again." });
-  }
+    return failDl(req, res, 503, { error: "Server busy", category: "queue-full", message: "The download queue is full right now.", hint: "Please wait a moment and try again." });
+  }, cleanup);
 });
 
 // ── GET /yt-search ────────────────────────────────────────────────────────────
@@ -1567,6 +1681,7 @@ router.get("/yt-diag", (req, res) => {
     ffmpegLocation: FFMPEG_LOCATION || "(PATH)",
     secret: API_SECRET ? "set" : "open",
     ytdlp: ytdlpStatus,
+    earlyHeaders: YT_EARLY_HEADERS,
     lookups: { active: lookupsActive, waiting: lookupsWaiting.length, concurrency: YT_INFO_MAX_CONCURRENT },
     // Performance knobs
     extractorArgs: (process.env.YTDLP_EXTRACTOR_ARGS || DEFAULT_EXTRACTOR_ARGS) || "(default web client)",
