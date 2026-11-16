@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.10.0 — instant lookups
+
+Only `youtube.js` has code changes. No route, parameter, signature or CORS change; responses keep their shape. The WordPress plugins need no update for this.
+
+- **Lookups answer in under a second.** A fresh `/yt-info` / `/yt-video-info` used to wait for the whole `yt-dlp -J` extraction (measured 13–25 s on the live server). The title, thumbnail, length and the quality list with sizes now come from one quick request to YouTube's own player endpoint, while the full extraction runs in the background exactly as before so the download that follows finds its metadata ready. If the quick request cannot answer (blocked, age-gated, unusual video, YouTube changed something) the route waits for yt-dlp as it always did. `YT_FAST_INFO=0` switches it off; `YT_FAST_INFO_TIMEOUT_MS` (3000) caps the quick request. The quick request does not use the proxy pool.
+- **A download started while that background extraction is still running waits for it** and reuses its result, instead of starting a second extraction next to it.
+- **Videos that do not exist are refused at once** (all player clients report it), and a permanent failure (private, removed, region-blocked, DRM, live) is remembered for 60 s so a repeat lookup or the download click does not run the extraction again.
+- **Failing proxies are rested.** A proxy that hits a bot-check is skipped for 10 minutes, one with a dead/slow connection for 3 minutes (the whole pool is used again if all are resting). `/yt-diag` shows `proxies.total` / `proxies.resting`.
+- **Lookups give up on a silent connection after 12 s** (`YT_LOOKUP_SOCKET_TIMEOUT_S`, yt-dlp's default is 20 s) and move on to another proxy.
+- Trade-off: the quick answer shows YouTube's 640 px thumbnail and its own spelling of the channel name; once the full extraction is cached, repeat lookups show yt-dlp's values as before. A video the quick request accepts but yt-dlp then cannot fetch now reports its error at the download click instead of at the lookup.
+- `/yt-diag` adds `fastInfo` and the counters `infoFast` / `infoFastMiss`.
+
 ## 1.9.0 — instant browser hand-off
 
 - **Downloads register in the browser immediately.** When the browser navigates to a signed `/yt-download` or `/yt-video-download` link, the response headers are now sent as soon as the video is confirmed downloadable (metadata is normally already cached from the lookup) and the job is accepted — not after the whole file has been built. The browser's own download manager takes over at that moment, so the download keeps going if the visitor closes the tab or leaves the site. The bytes follow when the file is ready.

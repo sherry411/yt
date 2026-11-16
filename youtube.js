@@ -431,9 +431,25 @@ function loadProxyPool() {
   _proxyPool = pool;
   return pool;
 }
+// Proxies that just failed (bot-check, dead/slow connection) are rested for a
+// few minutes so the next requests don't waste time on them (1.10.0). If every
+// proxy is resting, the whole pool is used again.
+const proxyCooldown = new Map(); // proxy -> timestamp (ms) until which it is skipped
 function pickProxy() {
   const pool = loadProxyPool();
-  return pool.length ? pool[Math.floor(Math.random() * pool.length)] : "";
+  if (!pool.length) return "";
+  const now = Date.now();
+  const rested = pool.filter((p) => !(proxyCooldown.get(p) > now));
+  const from = rested.length ? rested : pool;
+  return from[Math.floor(Math.random() * from.length)];
+}
+function noteProxyFailure(proxy, stderr) {
+  if (!proxy) return;
+  const text = String(stderr || "");
+  let ms = 0;
+  if (/sign in to confirm|not a bot|http error 429|too many requests|rate.?limit/i.test(text)) ms = 10 * 60 * 1000;
+  else if (/unable to connect to proxy|proxyerror|tunnel connection failed|timed out|timeout|connection refused|connection reset|remote end closed/i.test(text)) ms = 3 * 60 * 1000;
+  if (ms) proxyCooldown.set(proxy, Date.now() + ms);
 }
 
 // `forcedProxy` (optional): use exactly this proxy ("" = none) instead of picking
@@ -520,6 +536,12 @@ function skipNoteFrom(stdoutTail) {
 // can't exhaust the VPS (each one is a full Python process).
 const YT_INFO_MAX_CONCURRENT = Math.max(1, parseInt(process.env.YT_INFO_MAX_CONCURRENT || "6", 10) || 6);
 const YT_INFO_MAX_WAITING = Math.max(1, parseInt(process.env.YT_INFO_MAX_WAITING || "60", 10) || 60);
+// A lookup gives up on a silent connection (dead proxy) after this many seconds
+// and moves on to another proxy, instead of yt-dlp's default 20 s. 0 = default.
+const YT_LOOKUP_SOCKET_TIMEOUT_S = Math.max(0, parseInt(process.env.YT_LOOKUP_SOCKET_TIMEOUT_S || "12", 10) || 0);
+function lookupNetArgs() {
+  return YT_LOOKUP_SOCKET_TIMEOUT_S ? ["--socket-timeout", String(YT_LOOKUP_SOCKET_TIMEOUT_S)] : [];
+}
 let lookupsActive = 0;
 const lookupsWaiting = [];
 function releaseLookup() {
@@ -542,6 +564,7 @@ function execYtdlp(buildArgs, opts, cb) {
       attempt++;
       const proxy = pickProxy();
       execFile(YTDLP_BIN, buildArgs(proxy, fallback), opts, (err, stdout, stderr) => {
+        if (err) noteProxyFailure(proxy, stderr);
         if (err && attempt <= YT_PROXY_RETRIES && isBotCheckError(stderr)) {
           console.warn(`[yt-retry] bot-check, retry ${attempt}/${YT_PROXY_RETRIES}`);
           return run(fallback);
@@ -689,7 +712,7 @@ function makeTtlCache(ttlSeconds, maxEntries) {
 const playlistCache = makeTtlCache(YT_PLAYLIST_CACHE_S, 100);
 const searchCache = makeTtlCache(YT_SEARCH_CACHE_S, 500);
 const suggestCache = makeTtlCache(YT_SUGGEST_CACHE_S, 3000);
-const cacheStats = { infoHit: 0, infoMiss: 0, infoReused: 0, infoReuseFailed: 0, searchHit: 0, searchFast: 0, searchYtdlp: 0, suggestHit: 0 };
+const cacheStats = { infoHit: 0, infoMiss: 0, infoFast: 0, infoFastMiss: 0, infoReused: 0, infoReuseFailed: 0, searchHit: 0, searchFast: 0, searchYtdlp: 0, suggestHit: 0 };
 
 // Stable cache key for one video: its 11-char id when we can see it, else the URL.
 function videoCacheKey(url) {
@@ -717,6 +740,11 @@ try { fs.mkdirSync(INFO_CACHE_DIR, { recursive: true }); } catch (e) {}
 
 const infoCache = new Map();    // key -> { at, file, proxy, single, video, playlist }
 const infoInflight = new Map(); // key -> Promise (collapses simultaneous lookups)
+// Videos that can never be fetched (private, removed, region-blocked, DRM, live)
+// keep their error for a minute, so repeat lookups / the download click answer
+// at once instead of running the whole extraction again.
+const infoErrors = makeTtlCache(60, 500); // key -> { status, body }
+const PERMANENT_ERROR_CATEGORIES = ["private", "unavailable", "geo", "drm", "live", "too-long"];
 
 function dropInfo(key) {
   const e = infoCache.get(key);
@@ -827,25 +855,33 @@ function getVideoInfo(url, tag) {
   if (hit) { cacheStats.infoHit++; return Promise.resolve(hit); }
   const pending = infoInflight.get(key);
   if (pending) return pending;
+  const knownBad = infoErrors.get(key);
+  if (knownBad) return Promise.reject(knownBad);
   cacheStats.infoMiss++;
 
   const p = new Promise((resolve, reject) => {
-    const buildArgs = (proxy, fallback) => ["-J", "--no-warnings", "--no-playlist", "--cache-dir", YTDLP_CACHE_DIR, ...ytdlpCookieArgs(proxy, fallback), url];
+    const buildArgs = (proxy, fallback) => ["-J", "--no-warnings", "--no-playlist", "--cache-dir", YTDLP_CACHE_DIR, ...lookupNetArgs(), ...ytdlpCookieArgs(proxy, fallback), url];
     execYtdlp(buildArgs, { timeout: 45000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr, proxy) => {
       if (err) {
         console.error(`yt-dlp ${tag} error:`, stderr);
         const info = classifyDownloadError(stderr);
-        return reject({ status: 500, body: { error: info.message, category: info.category, hint: info.hint } });
+        const failure = { status: 500, body: { error: info.message, category: info.category, hint: info.hint } };
+        if (PERMANENT_ERROR_CATEGORIES.includes(info.category)) infoErrors.set(key, failure);
+        return reject(failure);
       }
       let meta;
       try { meta = JSON.parse(stdout); } catch (e) { return reject({ status: 500, body: { error: "Failed to parse video data" } }); }
       if (!meta) return reject({ status: 500, body: { error: "No video data" } });
 
       if (meta.is_live === true || meta.live_status === "is_live" || meta.live_status === "is_upcoming") {
-        return reject({ status: 400, body: { error: "This is a live stream or a premiere that hasn't finished yet, so it can't be downloaded.", category: "live", hint: "Try again after the stream has ended and YouTube has finished processing it." } });
+        const failure = liveError();
+        infoErrors.set(key, failure);
+        return reject(failure);
       }
       if (YT_MAX_DURATION_S && typeof meta.duration === "number" && meta.duration > YT_MAX_DURATION_S) {
-        return reject({ status: 400, body: { error: "This video is longer than the maximum length this downloader allows.", category: "too-long", hint: "Try a shorter video." } });
+        const failure = tooLongError();
+        infoErrors.set(key, failure);
+        return reject(failure);
       }
 
       const isList = Array.isArray(meta.entries);
@@ -878,6 +914,198 @@ function getVideoInfo(url, tag) {
   const clear = () => { if (infoInflight.get(key) === p) infoInflight.delete(key); };
   p.then(clear, clear);
   return p;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Instant lookups (1.10.0)
+// ═════════════════════════════════════════════════════════════════════════════
+// A full `yt-dlp -J` extraction takes 10–25 s on a busy server (Python start,
+// several player requests through a proxy, signature solving). The page only
+// needs the title, thumbnail, length and the list of qualities to show the
+// result, and YouTube's own player endpoint returns exactly that in well under a
+// second. So /yt-info and /yt-video-info now:
+//   1. start the full extraction in the BACKGROUND, exactly as before, so the
+//      download that follows finds its metadata ready in the cache; and
+//   2. answer the visitor from the quick request as soon as it arrives.
+// If the quick request can't answer (blocked, changed, age-gated, unusual video)
+// the route simply waits for the full extraction like it always did — so lookups
+// can only get faster, never break. YT_FAST_INFO=0 switches it off.
+const YT_FAST_INFO = process.env.YT_FAST_INFO !== "0";
+const YT_FAST_INFO_TIMEOUT_MS = Math.max(500, parseInt(process.env.YT_FAST_INFO_TIMEOUT_MS || "3000", 10) || 3000);
+
+function liveError() {
+  return { status: 400, body: { error: "This is a live stream or a premiere that hasn't finished yet, so it can't be downloaded.", category: "live", hint: "Try again after the stream has ended and YouTube has finished processing it." } };
+}
+function tooLongError() {
+  return { status: 400, body: { error: "This video is longer than the maximum length this downloader allows.", category: "too-long", hint: "Try a shorter video." } };
+}
+
+// Two player "clients" are asked at once: the app client lists every quality
+// with its size; the web client reliably returns the title/length even when the
+// app client is refused. Neither response is used for downloading.
+const FAST_CLIENTS = [
+  {
+    context: { clientName: "IOS", clientVersion: "20.10.4", deviceMake: "Apple", deviceModel: "iPhone16,2", osName: "iPhone", osVersion: "18.3.2.22D82", hl: "en", gl: "US" },
+    headers: { "User-Agent": "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)", "X-YouTube-Client-Name": "5", "X-YouTube-Client-Version": "20.10.4" },
+  },
+  {
+    context: { clientName: "WEB", clientVersion: "2.20250101.00.00", hl: "en", gl: "US" },
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" },
+  },
+];
+
+function fastPlayerRequest(client, id) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ context: { client: client.context }, videoId: id, contentCheckOk: true, racyCheckOk: true });
+    const upReq = https.request(
+      "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+      {
+        method: "POST",
+        agent: keepAliveAgent,
+        timeout: YT_FAST_INFO_TIMEOUT_MS,
+        headers: Object.assign({ "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), "Accept-Language": "en-US,en;q=0.9" }, client.headers),
+      },
+      (up) => {
+        if (up.statusCode !== 200) { up.resume(); return reject(new Error("HTTP " + up.statusCode)); }
+        const chunks = [];
+        let size = 0;
+        up.on("data", (c) => { size += c.length; if (size > 6 * 1024 * 1024) { up.destroy(new Error("too large")); return; } chunks.push(c); });
+        up.on("error", reject);
+        up.on("end", () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch (e) { reject(e); } });
+      }
+    );
+    // Hard cap on the whole exchange, not just on socket silence.
+    const cap = setTimeout(() => upReq.destroy(new Error("timeout")), YT_FAST_INFO_TIMEOUT_MS);
+    upReq.on("close", () => clearTimeout(cap));
+    upReq.on("timeout", () => upReq.destroy(new Error("timeout")));
+    upReq.on("error", reject);
+    upReq.end(body);
+  });
+}
+
+// Turn the player responses into the same bodies the routes have always sent.
+// Returns { single, video } — `video` is null when no quality list is available
+// (then /yt-video-info waits for yt-dlp). Throws when nothing usable came back.
+function shapeFastInfo(id, responses) {
+  const url = `https://www.youtube.com/watch?v=${id}`;
+  let details = null;
+  let formats = [];
+  let answered = 0;
+  let gone = 0;
+  for (const r of responses) {
+    if (!r || typeof r !== "object") continue;
+    answered++;
+    const ps = r.playabilityStatus || {};
+    if (ps.status === "ERROR") { gone++; continue; }
+    // Only trust a response that says the video plays, or the web client's
+    // routine "The page needs to be reloaded" refusal (its details are still
+    // right). Anything else — age gate, private, members-only, an unavailable
+    // stream recording, a bot check — is left to yt-dlp to judge.
+    const playable = ps.status === "OK";
+    if (!playable && !(ps.status === "UNPLAYABLE" && /reloaded/i.test(String(ps.reason || "")))) continue;
+    const d = r.videoDetails;
+    if (d && d.videoId === id && d.title && (!details || playable)) details = d;
+    const af = r.streamingData && Array.isArray(r.streamingData.adaptiveFormats) ? r.streamingData.adaptiveFormats : [];
+    if (playable && af.length > formats.length) formats = af;
+  }
+  // Every client says the video does not exist → answer that straight away.
+  if (answered > 1 && gone === answered) {
+    const e = { status: 500, body: { error: "This video is unavailable (removed, private, or taken down).", category: "unavailable", hint: "Try a different video." } };
+    e.final = true;
+    throw e;
+  }
+  if (!details) throw new Error("no details");
+  if (details.isLive === true || details.isUpcoming === true) { const e = liveError(); e.final = true; throw e; }
+
+  const duration = parseInt(details.lengthSeconds, 10);
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error("no duration");
+  if (YT_MAX_DURATION_S && duration > YT_MAX_DURATION_S) { const e = tooLongError(); e.final = true; throw e; }
+
+  const views = parseInt(details.viewCount, 10);
+  const meta = {
+    title: details.title,
+    uploader: details.author || "",
+    thumbnails: details.thumbnail && Array.isArray(details.thumbnail.thumbnails) ? details.thumbnail.thumbnails : [],
+    duration,
+    view_count: Number.isFinite(views) ? views : undefined,
+    webpage_url: url,
+    // Same field names videoShape() reads from yt-dlp's format list.
+    formats: formats.map((f) => {
+      const isVideo = /^video\//.test(String(f.mimeType || ""));
+      const bytes = parseInt(f.contentLength, 10) ||
+        Math.round(((parseInt(f.averageBitrate || f.bitrate, 10) || 0) / 8) * ((parseInt(f.approxDurationMs, 10) || duration * 1000) / 1000));
+      return { vcodec: isVideo ? "v" : "none", acodec: isVideo ? "none" : "a", height: isVideo ? f.height : undefined, filesize: bytes || 0 };
+    }),
+  };
+  if (!bestThumb(meta)) meta.thumbnail = `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+
+  const video = videoShape(meta, url);
+  return { single: singleShape(meta, url), video: video.qualities.length ? video : null };
+}
+
+const fastInfoCache = makeTtlCache(Math.min(YT_INFO_CACHE_S || 300, 1800), 500); // id -> { single, video }
+const fastInflight = new Map();
+
+function fastVideoInfo(id) {
+  const hit = fastInfoCache.get(id);
+  if (hit) return Promise.resolve(hit);
+  let p = fastInflight.get(id);
+  if (p) return p;
+  p = Promise.all(FAST_CLIENTS.map((c) => fastPlayerRequest(c, id).catch(() => null)))
+    .then((responses) => {
+      const shaped = shapeFastInfo(id, responses);
+      // Only keep a complete answer; a details-only one is retried next time.
+      if (shaped.video) fastInfoCache.set(id, shaped);
+      return shaped;
+    });
+  fastInflight.set(id, p);
+  const clear = () => { if (fastInflight.get(id) === p) fastInflight.delete(id); };
+  p.then(clear, clear);
+  return p;
+}
+
+// What the two info routes call. `want` is "single" (/yt-info) or "video"
+// (/yt-video-info). Resolves to the response body; rejects with { status, body }.
+function lookupVideo(url, tag, want) {
+  const key = videoCacheKey(url);
+  const pick = (entry) => (want === "single" ? (entry.playlist || entry.single) : entry.video);
+
+  const hit = freshInfo(key);
+  if (hit) { cacheStats.infoHit++; return Promise.resolve(pick(hit)); }
+
+  // Always start (or join) the full extraction: it is what the download needs.
+  const full = getVideoInfo(url, tag);
+  const id = key.startsWith("v:") ? key.slice(2) : "";
+  if (!YT_FAST_INFO || id.length !== 11) return full.then(pick);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let fastDone = false;
+    let fullFailed = false;
+    let fullErr = null;
+    const ok = (body) => { if (!settled) { settled = true; resolve(body); } };
+    const bad = (e) => { if (!settled) { settled = true; reject(e); } };
+
+    full.then(
+      (entry) => ok(pick(entry)),
+      (e) => { fullFailed = true; fullErr = e; if (fastDone) bad(e); }
+    );
+    fastVideoInfo(id).then(
+      (f) => {
+        fastDone = true;
+        if (fullFailed) return bad(fullErr);          // yt-dlp already said no → its reason wins
+        const body = want === "single" ? f.single : f.video;
+        if (body) { if (!settled) cacheStats.infoFast++; return ok(body); }
+        cacheStats.infoFastMiss++;                     // no quality list → wait for yt-dlp
+      },
+      (e) => {
+        fastDone = true;
+        if (e && e.final && e.status && e.body) return bad({ status: e.status, body: e.body });
+        cacheStats.infoFastMiss++;
+        if (fullFailed) bad(fullErr);
+      }
+    );
+  });
 }
 
 // ── Priority-aware job queue (independent of server.js's) ─────────────────────
@@ -928,14 +1156,14 @@ router.get("/yt-info", (req, res) => {
 
   // Single video: shared metadata cache (also primes the download that follows).
   if (!playlist) {
-    return getVideoInfo(url, "yt-info").then((entry) => res.json(entry.playlist || entry.single), fail);
+    return lookupVideo(url, "yt-info", "single").then((body) => res.json(body), fail);
   }
 
   // Playlist / mix: short-lived cache of the flat track list.
   const cached = playlistCache.get(url);
   if (cached) return res.json(cached);
 
-  const buildArgs = (proxy, fallback) => ["-J", "--no-warnings", "--cache-dir", YTDLP_CACHE_DIR, ...ytdlpCookieArgs(proxy, fallback), "--flat-playlist", url];
+  const buildArgs = (proxy, fallback) => ["-J", "--no-warnings", "--cache-dir", YTDLP_CACHE_DIR, ...lookupNetArgs(), ...ytdlpCookieArgs(proxy, fallback), "--flat-playlist", url];
   execYtdlp(buildArgs, { timeout: 45000, maxBuffer: 48 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
       console.error("yt-dlp yt-info error:", stderr);
@@ -1092,9 +1320,18 @@ router.get("/yt-download", (req, res) => {
     let current = null;
     let aborted = false;
     let softRetried = false;
+    let waitedForInfo = false;
 
     const runAttempt = (attempt, allowReuse, fallback) => {
       if (aborted) { cleanup(); releaseSlot(); return; }
+      // The lookup's extraction for this video is still running → wait for it and
+      // reuse its result instead of starting a second one next to it.
+      const inflight = allowReuse && !waitedForInfo ? infoInflight.get(videoCacheKey(url)) : null;
+      if (inflight) {
+        waitedForInfo = true;
+        const again = () => runAttempt(attempt, allowReuse, fallback);
+        return void inflight.then(again, again);
+      }
       cleanup(); // clear any partial output left by a previous attempt
 
       // Speed: if /yt-info (or /yt-video-info) looked this video up recently, hand
@@ -1158,6 +1395,7 @@ router.get("/yt-download", (req, res) => {
           const pick = files.find((f) => extOf(f) === fmt.ext) || files.find((f) => extOf(f) === fmt.audioFormat);
           if (pick) produced = path.join(dir, pick);
         } catch (e) {}
+        if (!produced && !cached && !timedOut) noteProxyFailure(proxy, stderr);
 
         // The saved metadata didn't work (expired/rejected media URL) → forget it
         // and run once more the normal way. Doesn't count as a proxy retry.
@@ -1251,8 +1489,8 @@ router.get("/yt-video-info", (req, res) => {
   }
   const url = normalizeYouTubeUrl(raw);
 
-  getVideoInfo(url, "yt-video-info").then(
-    (entry) => res.json(entry.video),
+  lookupVideo(url, "yt-video-info", "video").then(
+    (body) => res.json(body),
     (e) => {
       if (e && e.status && e.body) return res.status(e.status).json(e.body);
       console.error("yt-video-info unexpected error:", e);
@@ -1308,10 +1546,19 @@ router.get("/yt-video-download", (req, res) => {
     let current = null;
     let aborted = false;
     let softRetried = false;
+    let waitedForInfo = false;
     const finish = () => { if (finished) return; finished = true; cleanup(); releaseSlot(); };
 
     const runAttempt = (attempt, allowReuse, fallback) => {
       if (aborted) { finish(); return; }
+      // The lookup's extraction for this video is still running → wait for it and
+      // reuse its result instead of starting a second one next to it.
+      const inflight = allowReuse && !waitedForInfo ? infoInflight.get(videoCacheKey(url)) : null;
+      if (inflight) {
+        waitedForInfo = true;
+        const again = () => runAttempt(attempt, allowReuse, fallback);
+        return void inflight.then(again, again);
+      }
       // Clear any partial output left by a previous attempt.
       try { for (const f of fs.readdirSync(workDir)) fs.rmSync(path.join(workDir, f), { recursive: true, force: true }); } catch (e) {}
 
@@ -1381,6 +1628,7 @@ router.get("/yt-video-download", (req, res) => {
           const pick = files.find((f) => f.toLowerCase().endsWith(".mp4")) || files[0];
           if (pick) produced = path.join(workDir, pick);
         } catch (e) {}
+        if (!produced && !cached && !timedOut) noteProxyFailure(proxy, stderr);
 
         // The saved metadata didn't work (expired/rejected media URL) → forget it
         // and run once more the normal way. Doesn't count as a proxy retry.
@@ -1688,6 +1936,8 @@ router.get("/yt-diag", (req, res) => {
     aria2c: USE_ARIA2 ? "on" : (ARIA2_AVAILABLE ? "available (disabled)" : "not installed"),
     fragments: YTDLP_FRAGMENTS,
     infoCache: YT_INFO_CACHE_S ? { ttlSeconds: YT_INFO_CACHE_S, entries: infoCache.size } : "disabled",
+    fastInfo: YT_FAST_INFO ? { timeoutMs: YT_FAST_INFO_TIMEOUT_MS, entries: fastInfoCache.size } : "disabled",
+    proxies: { total: loadProxyPool().length, resting: Array.from(proxyCooldown.values()).filter((t) => t > Date.now()).length },
     cache: {
       searchEntries: searchCache.size,
       suggestEntries: suggestCache.size,

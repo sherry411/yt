@@ -1,6 +1,6 @@
 {
   "name": "trackgrab-backend",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "TrackGrab SoundCloud downloader backend",
   "main": "server.js",
   "scripts": {
