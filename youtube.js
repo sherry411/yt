@@ -32,6 +32,8 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const https = require("https");
+const http = require("http");
+const tls = require("tls");
 
 const router = express.Router();
 
@@ -954,14 +956,55 @@ const FAST_CLIENTS = [
   },
 ];
 
-function fastPlayerRequest(client, id) {
+// Open a TLS connection to host:443 THROUGH an HTTP proxy (CONNECT tunnel), so
+// the quick request can leave from a proxy IP when YouTube refuses the server's
+// own address (1.10.1). Only http:// proxies; anything else rejects.
+function proxyTlsSocket(proxyUrl, host) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(proxyUrl); } catch (e) { return reject(new Error("bad proxy url")); }
+    if (u.protocol !== "http:") return reject(new Error("unsupported proxy type"));
+    const headers = { Host: host + ":443" };
+    if (u.username) {
+      headers["Proxy-Authorization"] = "Basic " + Buffer.from(decodeURIComponent(u.username) + ":" + decodeURIComponent(u.password)).toString("base64");
+    }
+    const creq = http.request({ host: u.hostname, port: u.port || 80, method: "CONNECT", path: host + ":443", headers, timeout: YT_FAST_INFO_TIMEOUT_MS });
+    creq.on("connect", (cres, socket) => {
+      if (cres.statusCode !== 200) { socket.destroy(); return reject(new Error("proxy CONNECT " + cres.statusCode)); }
+      const secure = tls.connect({ socket, servername: host });
+      secure.once("secureConnect", () => resolve(secure));
+      secure.once("error", reject);
+    });
+    creq.on("timeout", () => creq.destroy(new Error("proxy timeout")));
+    creq.on("error", reject);
+    creq.end();
+  });
+}
+
+// `proxy` = "" → straight from the server (kept-alive connection); otherwise an
+// http:// proxy URL to tunnel through.
+function fastPlayerRequest(client, id, proxy) {
+  if (!proxy) return fastPlayerSend(client, id, keepAliveAgent);
+  let capped = false;
+  const cap = new Promise((_, reject) => setTimeout(() => { capped = true; reject(new Error("timeout")); }, YT_FAST_INFO_TIMEOUT_MS));
+  const viaProxy = proxyTlsSocket(proxy, "www.youtube.com").then((socket) => {
+    if (capped) { socket.destroy(); throw new Error("timeout"); }
+    const agent = new https.Agent({ keepAlive: false, maxSockets: 1 });
+    agent.createConnection = () => socket;
+    const done = () => { try { socket.destroy(); } catch (e) {} };
+    return fastPlayerSend(client, id, agent).then((v) => { done(); return v; }, (e) => { done(); throw e; });
+  });
+  return Promise.race([viaProxy, cap]);
+}
+
+function fastPlayerSend(client, id, agent) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ context: { client: client.context }, videoId: id, contentCheckOk: true, racyCheckOk: true });
     const upReq = https.request(
       "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
       {
         method: "POST",
-        agent: keepAliveAgent,
+        agent,
         timeout: YT_FAST_INFO_TIMEOUT_MS,
         headers: Object.assign({ "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), "Accept-Language": "en-US,en;q=0.9" }, client.headers),
       },
@@ -1043,6 +1086,93 @@ function shapeFastInfo(id, responses) {
   return { single: singleShape(meta, url), video: video.qualities.length ? video : null };
 }
 
+// Where the quick request is sent from (1.10.1). YouTube often refuses a
+// datacenter IP outright, so besides the server's own address the request also
+// goes through one http:// proxy from the pool, both at the same time; whichever
+// gives a complete answer first is used. When the server's own address keeps
+// failing while a proxy works, it is skipped for 10 minutes (and vice versa).
+// YT_FAST_INFO_PROXY=0 keeps the quick request off the proxies.
+const YT_FAST_INFO_PROXY = process.env.YT_FAST_INFO_PROXY !== "0";
+const FAST_ROUTE_REST_MS = 10 * 60 * 1000;
+const fastRouteRest = { direct: 0, proxy: 0 };   // timestamp until which a route is skipped
+const fastStatus = { direct: { ok: 0, miss: 0 }, proxy: { ok: 0, miss: 0 }, lastMiss: "", lastMissAt: "" };
+
+function pickHttpProxy() {
+  if (!YT_FAST_INFO_PROXY) return "";
+  const pool = loadProxyPool().filter((p) => /^http:\/\//i.test(p));
+  if (!pool.length) return "";
+  const now = Date.now();
+  const rested = pool.filter((p) => !(proxyCooldown.get(p) > now));
+  const from = rested.length ? rested : pool;
+  return from[Math.floor(Math.random() * from.length)];
+}
+
+// One line per player response for /yt-diag (never contains proxy addresses).
+function fastNote(route, client, r) {
+  const name = route + "/" + client.context.clientName + ": ";
+  if (r && r.__err) return name + "failed (" + r.__err + ")";
+  const ps = (r && r.playabilityStatus) || {};
+  return name + (ps.status || "no status") + (ps.reason ? " — " + String(ps.reason).slice(0, 70) : "") + (r && r.videoDetails ? "" : " [no details]");
+}
+
+function fastGather(id) {
+  const now = Date.now();
+  const proxy = pickHttpProxy();
+  let routes = [{ name: "direct", proxy: "" }];
+  if (proxy) routes.push({ name: "proxy", proxy });
+  const awake = routes.filter((r) => !(fastRouteRest[r.name] > now));
+  if (awake.length) routes = awake;
+
+  return new Promise((resolve, reject) => {
+    const all = [];      // usable player responses from every route so far
+    const notes = [];
+    const usable = {};   // route name -> gave details
+    let left = routes.length;
+    let settled = false;
+
+    const finish = (fn, v) => { if (!settled) { settled = true; fn(v); } };
+    const tryShape = (last) => {
+      let shaped;
+      try { shaped = shapeFastInfo(id, all); }
+      catch (e) {
+        if (e && e.final) return finish(reject, e);
+        if (last) {
+          fastStatus.lastMiss = notes.join(" | ").slice(0, 600);
+          fastStatus.lastMissAt = new Date().toISOString();
+          finish(reject, e);
+        }
+        return;
+      }
+      if (shaped.video || last) finish(resolve, shaped);
+    };
+
+    routes.forEach((route) => {
+      Promise.all(FAST_CLIENTS.map((c) => fastPlayerRequest(c, id, route.proxy).catch((e) => ({ __err: String((e && e.message) || e).slice(0, 60) }))))
+        .then((responses) => {
+          let good = false;
+          responses.forEach((r, i) => {
+            notes.push(fastNote(route.name, FAST_CLIENTS[i], r));
+            if (r && !r.__err) {
+              all.push(r);
+              const st = r.playabilityStatus && r.playabilityStatus.status;
+              if (r.videoDetails && (st === "OK" || st === "UNPLAYABLE")) good = true;
+              if (st === "ERROR") good = true; // a clear "does not exist" is a real answer too
+            }
+          });
+          usable[route.name] = good;
+          fastStatus[route.name][good ? "ok" : "miss"]++;
+          left--;
+          if (!left && routes.length > 1) {
+            // One route answers and the other doesn't → rest the one that doesn't.
+            if (usable.proxy && !usable.direct) fastRouteRest.direct = Date.now() + FAST_ROUTE_REST_MS;
+            if (usable.direct && !usable.proxy) fastRouteRest.proxy = Date.now() + FAST_ROUTE_REST_MS;
+          }
+          tryShape(!left);
+        });
+    });
+  });
+}
+
 const fastInfoCache = makeTtlCache(Math.min(YT_INFO_CACHE_S || 300, 1800), 500); // id -> { single, video }
 const fastInflight = new Map();
 
@@ -1051,13 +1181,11 @@ function fastVideoInfo(id) {
   if (hit) return Promise.resolve(hit);
   let p = fastInflight.get(id);
   if (p) return p;
-  p = Promise.all(FAST_CLIENTS.map((c) => fastPlayerRequest(c, id).catch(() => null)))
-    .then((responses) => {
-      const shaped = shapeFastInfo(id, responses);
-      // Only keep a complete answer; a details-only one is retried next time.
-      if (shaped.video) fastInfoCache.set(id, shaped);
-      return shaped;
-    });
+  p = fastGather(id).then((shaped) => {
+    // Only keep a complete answer; a details-only one is retried next time.
+    if (shaped.video) fastInfoCache.set(id, shaped);
+    return shaped;
+  });
   fastInflight.set(id, p);
   const clear = () => { if (fastInflight.get(id) === p) fastInflight.delete(id); };
   p.then(clear, clear);
@@ -1936,7 +2064,15 @@ router.get("/yt-diag", (req, res) => {
     aria2c: USE_ARIA2 ? "on" : (ARIA2_AVAILABLE ? "available (disabled)" : "not installed"),
     fragments: YTDLP_FRAGMENTS,
     infoCache: YT_INFO_CACHE_S ? { ttlSeconds: YT_INFO_CACHE_S, entries: infoCache.size } : "disabled",
-    fastInfo: YT_FAST_INFO ? { timeoutMs: YT_FAST_INFO_TIMEOUT_MS, entries: fastInfoCache.size } : "disabled",
+    fastInfo: YT_FAST_INFO ? {
+      timeoutMs: YT_FAST_INFO_TIMEOUT_MS,
+      entries: fastInfoCache.size,
+      viaProxy: YT_FAST_INFO_PROXY,
+      direct: Object.assign({ resting: fastRouteRest.direct > Date.now() }, fastStatus.direct),
+      proxy: Object.assign({ resting: fastRouteRest.proxy > Date.now() }, fastStatus.proxy),
+      lastMiss: fastStatus.lastMiss,
+      lastMissAt: fastStatus.lastMissAt,
+    } : "disabled",
     proxies: { total: loadProxyPool().length, resting: Array.from(proxyCooldown.values()).filter((t) => t > Date.now()).length },
     cache: {
       searchEntries: searchCache.size,

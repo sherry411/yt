@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.10.1 — instant lookups through the proxy pool
+
+- On the live server the 1.10.0 quick lookup never answered: YouTube refuses the server's own (datacenter) address, so every lookup still waited for yt-dlp. The quick request is now also sent through one `http://` proxy from the pool (a plain CONNECT tunnel, no new dependency), at the same time as the direct one; the first complete answer is used. A route that keeps failing while the other works is skipped for 10 minutes. `YT_FAST_INFO_PROXY=0` keeps the quick request off the proxies. SOCKS proxies are not used for it.
+- `/yt-diag` → `fastInfo` now shows, per route (`direct` / `proxy`), how often it answered, whether it is resting, and `lastMiss`: what YouTube replied the last time the quick lookup could not answer (no proxy addresses are shown).
+
 ## 1.10.0 — instant lookups
 
 Only `youtube.js` has code changes. No route, parameter, signature or CORS change; responses keep their shape. The WordPress plugins need no update for this.
